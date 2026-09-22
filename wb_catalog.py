@@ -760,6 +760,39 @@ _CN_JSON = r'''
         1000000
       ]
     },
+    "credits": "x0.00",
+    "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities",
+    "descriptionZh": "混元思考模型，具有增强的推理能力",
+    "disabledMultimodal": false,
+    "id": "hy4-preview-f",
+    "maxAllowedSize": 1000000,
+    "maxInputTokens": 1000000,
+    "maxOutputTokens": 64000,
+    "name": "Hy4 preview",
+    "onlyReasoning": true,
+    "reasoning": {
+      "canDisableThinking": false,
+      "defaultEffort": "high",
+      "summary": "auto",
+      "supportedEfforts": [
+        "high"
+      ]
+    },
+    "supportsImages": true,
+    "supportsReasoning": true,
+    "supportsToolCall": true,
+    "temperature": 0.9,
+    "top_p": 1,
+    "vendor": "j"
+  },
+  {
+    "contextWindow": {
+      "defaultLength": 300000,
+      "supportedLengths": [
+        300000,
+        1000000
+      ]
+    },
     "credits": "x0.29",
     "descriptionEn": "Hunyuan's thinking model with enhanced reasoning capabilities",
     "descriptionZh": "混元思考模型，具有增强的推理能力",

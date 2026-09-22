@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.5.1-2496ED?style=flat-square" alt="Version 1.5.1"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.5.4-2496ED?style=flat-square" alt="Version 1.5.4"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -205,6 +205,28 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 ---
 
 ## 六、版本更新记录 (Changelog)
+
+### v1.5.4
+
+- **国内版模型目录补上 `hy4-preview-f`**：国内版白名单 `CN_UI_ORDER` 的第一项就是 `hy4-preview-f`，但内置的国内版静态目录里只有同名的旧 id `hy4-preview`（x0.29），它不在白名单里、会被裁剪掉，而 `hy4-preview-f` 本身只能靠本机桌面端缓存补进来。国内版没有国际版那样的上游兜底，所以在没装过国内版桌面端的机器上，国内版列表会少一个、Hy4 preview 直接消失。现按桌面端缓存里的实际条目补进静态目录（x0.00、1M 输入 / 64k 输出、推理档 high）。
+
+- **看板显示积分消耗与账号昵称**（PR #45，感谢 [@Pro-XK](https://github.com/Pro-XK)）：最近请求表新增「积分」列（逐条请求的上游扣费），账号列改显示昵称并在 tooltip 里保留完整 uid（账号已不在池中时回退 uid 前缀）；「网关调用量」卡片副标题追加累计积分；账号透视表新增「消耗积分」列，跟随「今日 / 全部历史」切换。
+
+- **积分口径统一**：卡片读 `/usage`（当前出口、原先只累计成功请求），透视表读 `/usage/analytics`（全出口、含失败请求），同一页面上两个都叫「消耗积分」的数字永远对不上。现在两边统一为「上游实际计费过的请求都计入，客户端取消不计」——失败请求若已被上游扣费同样计入；卡片文案改为「本出口累计消耗」、透视表列名改为「消耗积分 (全出口)」，把各自覆盖的范围写明。另外 credit 记录为 0 的行现在显示 `0.00` 而不是 `—`。
+
+### v1.5.3
+
+- **移除网关内置的 `web_search` / `web_fetch` 代跑**（修复 issue #43）：v1.5.0 曾让网关在客户端声明这两个工具时自行注入定义、拦截调用、在本地执行搜索并把结果喂回模型。该实现有三个缺陷：参数名只认 `query`（模型若传 `queries` 数组会被判成"查询为空"）、客户端原有的声明未被去重导致工具被重复下发、以及内部循环耗尽后发出一条合成的 `resp_wrapup`（`status=completed`、`output=[]`）——把一次工具失败伪装成"回答正常结束"，用户看到的是回答说到一半突然停住。
+
+  实测确认**上游本来就没有服务端 `web_search` 能力**：直接向上游声明 `{"type":"web_search"}` / `web_search_preview` / `web_fetch`，国际版与国内版的模型反应均与"不声明任何工具"完全一致（都回答"我无法联网搜索"），调用次数为 0。因此不再由网关代跑，**工具声明原样透传**：客户端能拿到自己声明的工具调用，模型在无搜索能力时如实回答"我无法联网"。
+
+  行为变化：声明 `web_search` 的客户端不再获得网关代跑的搜索结果；如果客户端自己声明的是普通函数形式的搜索工具，工具调用现在会正常返回给客户端（此前会被网关吞掉）。
+
+### v1.5.2
+
+- **修复 Docker 镜像缺少运行时模块**（PR #41，感谢 [@wiggins-kong](https://github.com/wiggins-kong)）：v1.5.0 新增 `wb_identity.py` 与 `wb_webtools.py` 后，Dockerfile 仍沿用 v1.5.0 之前的显式 COPY 清单，两个模块未进入镜像。容器启动即报 `ModuleNotFoundError: No module named 'wb_identity'`，Docker 部署完全不可用。现改为 `COPY wb_*.py dashboard.html ./`，按既有 `wb_*.py` 命名约定自动纳入，后续新增模块不会再漏。
+
+  > 影响范围：**仅 Docker 部署**。v1.5.0 / v1.5.1 的标签提交与 ghcr 镜像受影响；便携绿色包始终包含全部模块，Windows / macOS 直接运行不受影响。使用 Docker 的用户请升级到本版本。
 
 ### v1.5.1
 

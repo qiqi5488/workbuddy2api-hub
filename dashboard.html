@@ -640,6 +640,7 @@ a:hover{text-decoration:underline}
               <th>剩余积分 / 额度</th>
               <th>请求次数</th>
               <th>消耗总 Token</th>
+              <th>消耗积分 (全出口)</th>
               <th style="text-align:left">调用的模型分布明细 (请求数 · 消耗)</th>
             </tr>
           </thead>
@@ -2124,7 +2125,7 @@ async function refreshInner(){
   document.getElementById('cards').innerHTML =
     card('可用账号池', activeAccts + ' <span style="font-size:13px;font-weight:400;color:var(--dim)">/ ' + totalAccts + ' 正常</span>', (totalAccts - activeAccts > 0 ? (totalAccts - activeAccts) + ' 个停用' : '全部启用 · 状态健康'), 'accent') +
     card('积分余额', hasCreds ? (fmt(totRemain) + ' <span style="font-size:13px;font-weight:400;color:var(--dim)">积分</span>') : '正常可用', subCredit, 'accent2') +
-    card('网关调用量', fmt(t.requests) + ' <span style="font-size:13px;font-weight:400;color:var(--dim)">次</span>', '累计消耗 ' + fmt(t.total_tokens) + ' Token', '') +
+    card('网关调用量', fmt(t.requests) + ' <span style="font-size:13px;font-weight:400;color:var(--dim)">次</span>', '本出口累计消耗 ' + fmt(t.total_tokens) + ' Token · ' + Number(t.credit || 0).toFixed(2) + ' 积分', '') +
     card('请求成功率', succStr, errSub, perf.errors ? 'warn' : 'accent2');
 
   const total = recent.total || 0;
@@ -2164,12 +2165,19 @@ async function refreshInner(){
   };
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
+  // 账号列显示昵称：uid -> 昵称取自 /usage 的 accounts_map（当前账号池）。
+  // 已删除/不存在的账号回退到 uid 前 8 位，避免留空。
+  const acctName = (uid) => {
+    if(!uid) return '—';
+    const m = (t.accounts_map && t.accounts_map[uid]);
+    return (m && m.nickname) ? m.nickname : String(uid).slice(0,8);
+  };
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table class="data-cards"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>结果</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table class="data-cards"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>结果</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th>积分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono" data-label="时间">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono" data-label="模型">' + esc(r.model) + '</td>'
-        + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号">' + esc((r.account||'—').slice(0,8)) + '</td>'
+        + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号" title="' + esc(r.account||'') + '">' + esc(acctName(r.account)) + '</td>'
         + '<td data-label="模式"><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td data-label="结果">' + outcomeBadge(r) + '</td>'
         + '<td data-label="耗时">' + (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—') + '</td>'
@@ -2180,6 +2188,7 @@ async function refreshInner(){
         + '<td style="color:var(--think)" data-label="思考">' + fmt(r.reasoning_tokens) + '</td>'
         + '<td data-label="缓存">' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
         + '<td data-label="总 token"><b>' + fmt(r.total_tokens) + '</b></td>'
+        + '<td data-label="积分" style="color:var(--accent2)">' + (r.credit != null ? Number(r.credit).toFixed(2) : '—') + '</td>'
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
 }
@@ -3807,7 +3816,7 @@ function renderAnalytics(data){
 
   if(acctTbody){
     if(!accts.length){
-      acctTbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号用量数据</td></tr>';
+      acctTbody.innerHTML = '<tr><td colspan="7" class="empty">暂无账号用量数据</td></tr>';
     } else {
       acctTbody.innerHTML = accts.map(a => {
         const st = isToday ? a.today : a.all_time;
@@ -3846,6 +3855,7 @@ function renderAnalytics(data){
           + '<td>' + creditStr + '</td>'
           + '<td>' + fmt(st.requests || 0) + '</td>'
           + '<td><b style="color:var(--accent)">' + fmt(st.total_tokens || 0) + '</b></td>'
+          + '<td><b style="color:var(--accent2)">' + (st.credit != null ? Number(st.credit).toFixed(2) : '0.00') + '</b></td>'
           + '<td style="text-align:left;max-width:440px">' + pills + '</td>'
           + '</tr>';
       }).join('');

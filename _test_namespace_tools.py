@@ -105,8 +105,15 @@ check("namespaced tool reaches the chat body",
       "js" in by_name and by_name["js"]["type"] == "function")
 check("namespace map rides along for the return trip",
       chat.get("_namespace_map", {}).get("js") == "node_repl", chat.get("_namespace_map"))
-check("web_search declaration is kept for the local implementation",
+check("web_search declaration is passed through untouched",
       any(t.get("type") == "web_search" for t in tools))
+# The gateway used to turn this declaration into a function of its own and run
+# it locally. It no longer does: the upstream has no server-side search tool
+# (measured — declaring one leaves the model answering "I can't browse"), so
+# the gateway forwards what the client sent instead of standing in for it.
+check("the gateway no longer injects its own web_search function",
+      not any((t.get("function") or {}).get("name") == "web_search" for t in tools),
+      tools)
 body = P.build_upstream_body(dict(chat))
 up = {t.get("function", {}).get("name"): t for t in body["tools"] if isinstance(t, dict)}
 check("upstream body wraps the flattened tools as chat functions",
