@@ -290,6 +290,10 @@ a:hover{text-decoration:underline}
   #pageSettings section > div[style*="display:flex"]{flex-wrap:wrap}
   #pageSettings input:not([type=checkbox]), #pageSettings select{min-height:40px;font-size:13px}
   #pageSettings .slot-input{font-size:13px}
+  /* Per-key model picker: the chips are the tap targets, so they follow the
+     same ≥40px rule as every other control in this form. */
+  #pageSettings [id^="editKeyModels_"] label{min-height:40px;padding:8px 12px;font-size:13px}
+  #pageSettings [id^="editKeyModels_"] input[type=checkbox]{width:18px;height:18px}
   table.data-cards td[data-label="启用"]{justify-content:space-between}
   table.data-cards td[data-label="启用"] input[type=checkbox]{width:20px;height:20px}
   /* Logs */
@@ -2405,6 +2409,8 @@ async function loadSettings(showToast){
       stored_key: '',
       masked: k.masked || '',
       realm: k.realm || '',
+      // Empty means "every model"; the picker treats it as unrestricted.
+      models: (k.models || []).slice(),
       enabled: k.enabled !== false,
       created_at: k.created_at || '',
       _editing: false,
@@ -2464,6 +2470,64 @@ const REALM_CHOICES = [
   ['cn', '固定国内版出口'],
 ];
 
+/* ---- per-key model allowlist ----
+   A key with an empty list may use every model, which is how every key
+   written before this field existed behaves. The list offered is the one for
+   the exit the panel is currently showing, so switching the exit re-scopes
+   what can be ticked; models already stored on the key are always kept. */
+function modelChoicesHtml(index, row){
+  const list = (MODELS_DATA || []).map(m => m.id).filter(Boolean);
+  const selected = new Set((row.models || []).map(m => String(m).toLowerCase()));
+  // Models stored on this key that the exit on screen does not list (the key
+  // is bound to the other exit, or the catalog changed) are still rendered.
+  // Leaving them out would drop them from the row on the next save, silently
+  // widening a restricted key.
+  const extra = (row.models || []).filter(m => !list.some(id => String(id).toLowerCase() === String(m).toLowerCase()));
+  if(!list.length && !extra.length){
+    return '<div style="font-size:12px;color:var(--dim);padding:6px 0">'
+      + '模型列表尚未加载，稍后重试；留空表示不限制。</div>';
+  }
+  const chip = (mid, outOfView) => {
+    const on = selected.has(String(mid).toLowerCase());
+    return '<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;'
+      + 'background:var(--panel2);border:1px solid ' + (on ? 'var(--accent)' : 'var(--line)') + ';'
+      + 'border-radius:999px;padding:4px 10px;cursor:pointer">'
+      + '<input type="checkbox" data-model="' + esc(mid) + '"' + (on ? ' checked' : '')
+      + ' onchange="onKeyModelToggle(this)">' + esc(mid)
+      + (outOfView ? '<span style="color:var(--dim-light)">(另一出口)</span>' : '') + '</label>';
+  };
+  return '<div id="editKeyModels_' + index + '" style="display:flex;flex-wrap:wrap;gap:6px">'
+    + list.map(mid => chip(mid, false)).join('')
+    + extra.map(mid => chip(mid, true)).join('')
+    + '</div>';
+}
+
+function onKeyModelToggle(el){
+  const label = el && el.closest ? el.closest('label') : null;
+  if(label) label.style.borderColor = el.checked ? 'var(--accent)' : 'var(--line)';
+}
+
+function toggleAllKeyModels(index, on){
+  const box = document.getElementById('editKeyModels_' + index);
+  if(!box) return;
+  box.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    cb.checked = on;
+    const label = cb.closest ? cb.closest('label') : null;
+    if(label) label.style.borderColor = on ? 'var(--accent)' : 'var(--line)';
+  });
+}
+
+function readKeyModels(index){
+  const box = document.getElementById('editKeyModels_' + index);
+  if(!box) return (API_KEY_ROWS[index] || {}).models || [];
+  const out = [];
+  box.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    const mid = cb.getAttribute('data-model');
+    if(cb.checked && mid) out.push(mid);
+  });
+  return out;
+}
+
 function renderKeyRows(){
   const box = document.getElementById('keyList');
   if(!box) return;
@@ -2494,6 +2558,16 @@ function renderKeyRows(){
         +     '</select>'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
+        +     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
+        +       '<div style="font-size:12px;color:var(--dim);font-weight:500">可用模型 <span style="color:var(--dim-light)">(不勾选 = 不限制；当前出口的模型)</span></div>'
+        +       '<div style="display:flex;gap:6px">'
+        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="toggleAllKeyModels(' + i + ', true)">全选</button>'
+        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="toggleAllKeyModels(' + i + ', false)">清空</button>'
+        +       '</div>'
+        +     '</div>'
+        +     modelChoicesHtml(i, row)
+        +   '</div>'
+        +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">API Key 内容 ' + (row.masked ? '<span style="color:var(--dim-light)">(已保存: ' + esc(row.masked) + '，留空表示不改)</span>' : '') + '</div>'
         +     '<div style="display:flex;gap:8px">'
         +       '<input type="text" id="editKeyValue_' + i + '" value="' + esc(row.key || '') + '" placeholder="' + (row.masked ? '留空表示保持原 Key 不变' : '输入自定义密钥，或点击右侧生成') + '" '
@@ -2519,6 +2593,11 @@ function renderKeyRows(){
       ? '<span class="realm-badge-cn" style="font-size:11px">固定国内版出口</span>'
       : '<span class="badge s" style="font-size:11px">跟随面板切换</span>';
 
+    const modelCount = (row.models || []).length;
+    const modelBadge = modelCount
+      ? '<span class="badge s" style="font-size:11px" title="' + esc((row.models || []).join(', ')) + '">限 ' + modelCount + ' 个模型</span>'
+      : '<span class="badge" style="font-size:11px">全部模型</span>';
+
     const displayKey = row.masked || (row.key ? (row.key.slice(0, 4) + '******' + row.key.slice(-4)) : '未设置');
     const createdStr = row.created_at ? ('创建时间 ' + esc(row.created_at)) : '';
 
@@ -2529,6 +2608,7 @@ function renderKeyRows(){
       +       '<span style="font-size:15px;font-weight:700;color:var(--fg)">' + esc(row.name || '未命名') + '</span>'
       +       statusBadge
       +       realmBadge
+      +       modelBadge
       +     '</div>'
       +     '<div style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
@@ -2579,6 +2659,7 @@ async function saveSingleKey(index, btn){
   const name = nameInput ? nameInput.value.trim() : (row.name || '');
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
+  const models = readKeyModels(index);
 
   if(!keyVal && !row.masked){
     toast('API Key 不能为空', 'warn');
@@ -2587,6 +2668,7 @@ async function saveSingleKey(index, btn){
 
   row.name = name || '未命名';
   row.realm = realm;
+  row.models = models;
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -2630,6 +2712,7 @@ function addApiKeyRow(){
     name: '',
     key: randomKeyValue(),
     realm: '',
+    models: [],
     enabled: true,
     masked: '',
     _editing: true
@@ -2692,6 +2775,7 @@ async function saveApiKeys(btn){
     id: row.id || '',
     name: row.name || '',
     realm: row.realm || '',
+    models: row.models || [],
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),

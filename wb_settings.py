@@ -147,6 +147,24 @@ def ensure_launcher_key(accounts_dir):
 REALMS = ("", "intl", "cn")
 
 
+def _clean_key_models(value):
+    """Normalize one key's model allowlist; an empty list means "every model".
+
+    Stored lowercased because model ids are matched case-insensitively, so a
+    panel that saves `GLM-5.3` still restricts exactly the model upstream
+    answers to as `glm-5.3`.
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    out, seen = [], set()
+    for raw in value:
+        mid = str(raw or "").strip().lower()
+        if mid and mid not in seen:
+            seen.add(mid)
+            out.append(mid)
+    return out
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -162,9 +180,22 @@ def _clean_key_entry(entry):
         "name": str(entry.get("name") or "").strip() or "未命名",
         "key": key,
         "realm": realm,
+        "models": _clean_key_models(entry.get("models")),
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
     }
+
+
+def key_allows_model(entry, model):
+    """True when `entry` may call `model`.
+
+    An empty allowlist is unrestricted, which is what every key written before
+    the field existed reads back as - so an upgrade cannot lock anyone out.
+    """
+    allowed = (entry or {}).get("models") or []
+    if not allowed:
+        return True
+    return str(model or "").strip().lower() in allowed
 
 
 def _unique_key_id(candidate, used):
@@ -225,6 +256,7 @@ def api_keys(accounts_dir):
                 "name": "默认（跟随面板切换）",
                 "key": legacy,
                 "realm": "",
+                "models": [],
                 "enabled": True,
             }]
     return []
@@ -275,6 +307,7 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
                 "name": "启动参数",
                 "key": candidate,
                 "realm": "",
+                "models": [],
                 "enabled": True,
                 "source": "launcher",
             }

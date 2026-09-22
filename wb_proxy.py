@@ -1306,6 +1306,7 @@ def runtime_settings_view():
             "id": entry.get("id") or "",
             "name": entry.get("name") or "",
             "realm": entry.get("realm") or "",
+            "models": list(entry.get("models") or []),
             "enabled": entry.get("enabled", True) is not False,
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8 else "*" * len(raw),
             "source": entry.get("source") or "panel",
@@ -4433,6 +4434,25 @@ class Handler(BaseHTTPRequestHandler):
         return ("模型 %s 只在%s提供，但「%s」绑定的是%s出口。"
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
+    def _model_allowed_error(self, model):
+        """Reject a model this key is not allowed to use; "" when it may run.
+
+        Without this, a key restricted in the panel could still be pointed at
+        any model id by hand and the gateway would spend the account's quota on
+        it - the restriction would only ever have hidden the model from
+        /v1/models. Returns "" when the request was authenticated by the panel
+        itself, which is how the dashboard reads every model.
+        """
+        entry = self.key_entry or {}
+        if not entry:
+            return ""
+        if wb_settings.key_allows_model(entry, model):
+            return ""
+        allowed = "、".join(entry.get("models") or [])
+        name = entry.get("name") or "当前 Key"
+        return ("模型 %s 不在「%s」允许的模型范围内。该 Key 目前只能使用：%s。"
+                "请改用列表内的模型，或在看板「设置」页为该 Key 调整模型范围。"
+                % (model, name, allowed or "（未配置）"))
     def _banned_model_error(self, model):
         """被封鎖的模型直接報錯，不碰上游、不扣任何點數。"""
         if not is_model_banned(model):
@@ -4614,6 +4634,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._error(502, str(exc))
         data = [model_entry(mid, meta) for mid, meta in entries]
+        # A key restricted to specific models must only discover those, or a
+        # client's model picker advertises models every call would then reject.
+        allowed = (self.key_entry or {}).get("models") or []
+        if allowed:
+            wanted = set(allowed)
+            data = [item for item in data if str(item.get("id") or "").lower() in wanted]
         return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
 
     def _get_v1_usage(self, query):
@@ -4939,12 +4965,29 @@ class Handler(BaseHTTPRequestHandler):
                 if realm not in ("", "intl", "cn"):
                     return self._error(400, "realm must be intl, cn or empty",
                                        "invalid_request_error")
+                # An absent field on a row that already exists keeps whatever is
+                # stored, so a client that saves only the fields it knows about
+                # (an older panel build) cannot silently widen a restricted key.
+                if "models" in item:
+                    raw_models = item.get("models")
+                    if raw_models is None:
+                        raw_models = []
+                    if not isinstance(raw_models, (list, tuple)):
+                        return self._error(400, "models must be a list",
+                                           "invalid_request_error")
+                    models = [str(m or "").strip() for m in raw_models if str(m or "").strip()]
+                    if any(len(m) > 200 for m in models):
+                        return self._error(400, "a model id is too long",
+                                           "invalid_request_error")
+                else:
+                    models = list((existing.get(entry_id) or {}).get("models") or [])
                 created_at = item.get("created_at") or (existing.get(entry_id, {}).get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
                     "key": value,
                     "realm": realm,
+                    "models": models,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
                 })
@@ -5552,6 +5595,9 @@ class Handler(BaseHTTPRequestHandler):
             banned = self._banned_model_error(chat_req.get("model"))
             if banned:
                 return self._error(400, banned, "invalid_request_error")
+            not_allowed = self._model_allowed_error(chat_req.get("model"))
+            if not_allowed:
+                return self._error(400, not_allowed, "invalid_request_error")
             upstream, account = open_upstream(chat_req, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
@@ -5779,6 +5825,9 @@ class Handler(BaseHTTPRequestHandler):
             banned = self._banned_model_error(payload.get("model"))
             if banned:
                 return self._error(400, banned, "invalid_request_error")
+            not_allowed = self._model_allowed_error(payload.get("model"))
+            if not_allowed:
+                return self._error(400, not_allowed, "invalid_request_error")
             upstream, account = open_upstream(payload, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
