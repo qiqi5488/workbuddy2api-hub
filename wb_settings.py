@@ -165,6 +165,54 @@ def _clean_key_models(value):
     return out
 
 
+def _clean_key_expiry(value):
+    """Normalize one key's expiry to epoch seconds.
+
+    0 means "never expires", which is what every key written before the field
+    existed reads back as. Anything unparseable becomes a negative instant
+    (already past) rather than 0: a hand-edited file with a typo must not
+    silently grant a key permanent validity, and the panel shows such a key as
+    expired, so the mistake is visible instead of invisible.
+    """
+    if value is None or value == "" or value is False:
+        return 0
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return -1
+    return seconds
+
+
+def key_is_expired(entry, now=None):
+    """True once a key's validity window has closed.
+
+    Evaluated against the clock on every call, so a key stops working the
+    moment its deadline passes without anything having to run in the
+    background. An unparseable deadline counts as expired (fail closed).
+    """
+    expires_at = (entry or {}).get("expires_at")
+    if expires_at is None:
+        expires_at = 0
+    try:
+        expires_at = float(expires_at)
+    except (TypeError, ValueError):
+        return True
+    if expires_at == 0:
+        return False
+    return (now if now is not None else time.time()) >= expires_at
+
+
+def key_expiry_text(entry):
+    """Human-readable deadline for error messages, or "" when it never expires."""
+    try:
+        expires_at = float((entry or {}).get("expires_at") or 0)
+    except (TypeError, ValueError):
+        return "未知"
+    if expires_at <= 0:
+        return ""
+    return time.strftime("%Y/%m/%d %H:%M", time.localtime(expires_at))
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -181,6 +229,7 @@ def _clean_key_entry(entry):
         "key": key,
         "realm": realm,
         "models": _clean_key_models(entry.get("models")),
+        "expires_at": _clean_key_expiry(entry.get("expires_at")),
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
     }
@@ -257,6 +306,7 @@ def api_keys(accounts_dir):
                 "key": legacy,
                 "realm": "",
                 "models": [],
+                "expires_at": 0,
                 "enabled": True,
             }]
     return []
@@ -288,8 +338,12 @@ def set_api_keys(accounts_dir, keys):
 def match_api_key(accounts_dir, supplied, extra_keys=()):
     """Find which configured key a request presented, if any.
 
-    Returns a copy of the entry (with a `source` field) so the caller can read
-    the bound realm, or None when nothing matches.
+    Returns a copy of the entry (with `source` and `expired` fields) so the
+    caller can read the bound realm, or None when nothing matches. A key past
+    its deadline is still returned, flagged `expired`: the caller has to refuse
+    it either way, but answering "已到达使用时间" instead of "invalid api key"
+    is the difference between an operator understanding the outage and hunting
+    for a typo in a key that is in fact correct.
     """
     supplied = (supplied or "").strip()
     if not supplied:
@@ -298,6 +352,7 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
         if entry["enabled"] and hmac.compare_digest(supplied, entry["key"]):
             out = dict(entry)
             out["source"] = "panel"
+            out["expired"] = key_is_expired(entry)
             return out
     for candidate in extra_keys:
         candidate = (candidate or "").strip()
@@ -308,6 +363,8 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
                 "key": candidate,
                 "realm": "",
                 "models": [],
+                "expires_at": 0,
+                "expired": False,
                 "enabled": True,
                 "source": "launcher",
             }

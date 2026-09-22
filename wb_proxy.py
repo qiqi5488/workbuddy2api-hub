@@ -1307,6 +1307,8 @@ def runtime_settings_view():
             "name": entry.get("name") or "",
             "realm": entry.get("realm") or "",
             "models": list(entry.get("models") or []),
+            "expires_at": int(entry.get("expires_at") or 0),
+            "expired": bool(wb_settings.key_is_expired(entry)),
             "enabled": entry.get("enabled", True) is not False,
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8 else "*" * len(raw),
             "source": entry.get("source") or "panel",
@@ -4088,6 +4090,10 @@ class Handler(BaseHTTPRequestHandler):
     # Which configured API key the caller used, set by _key_ok(). Its bound
     # realm decides the upstream exit for this request alone.
     key_entry = None
+    # Set when the caller presented a key that matched but is past its
+    # deadline. The request is refused; this only carries why, so the reply can
+    # say the key ran out of time instead of implying it was wrong.
+    expired_entry = None
     # The stdlib default caps the request line at 64KB and answers an opaque
     # bare "414 Request-URI Too Long" for anything longer. Raise it and reply in
     # the normal JSON error shape so an over-long URL is diagnosable.
@@ -4099,6 +4105,7 @@ class Handler(BaseHTTPRequestHandler):
         # it inherited the realm binding of whatever API key used the connection
         # before it - sending that request to the wrong upstream exit.
         self.key_entry = None
+        self.expired_entry = None
         # Body-tracking state must also start clean for every request, otherwise
         # a later drain would skip a body that has not been read yet.
         self._body_consumed = False
@@ -4408,12 +4415,27 @@ class Handler(BaseHTTPRequestHandler):
         # so the browser never has to keep the API key in localStorage.
         if self._panel_ok():
             return True
-        self.key_entry = identify_key(self._supplied_key())
+        entry = identify_key(self._supplied_key())
+        if entry and entry.get("expired"):
+            # Matched, but its validity window has closed: it is not a usable
+            # credential. Remember which key it was so _authorized() can say so,
+            # and drop it so it grants neither access nor a realm binding.
+            self.expired_entry = entry
+            entry = None
+        self.key_entry = entry
         if self.key_entry:
             return True
         if not auth_required():
+            # Checking is switched off entirely, so an expired key is no worse
+            # than the anonymous request that would also be let through here.
             return True
         return False
+    def _expired_key_message(self, entry):
+        name = (entry or {}).get("name") or "当前 Key"
+        when = wb_settings.key_expiry_text(entry)
+        return ("API Key「%s」已到达使用时间%s，已自动失效。"
+                "请联系管理员延长有效期或更换新的 Key（看板「设置」页）。"
+                % (name, ("（有效期至 %s）" % when) if when else ""))
     def _key_realm(self):
         """Realm bound to the key this request used, or "" when unbound."""
         return (self.key_entry or {}).get("realm") or ""
@@ -4480,6 +4502,11 @@ class Handler(BaseHTTPRequestHandler):
     def _authorized(self):
         if self._key_ok():
             return True
+        if self.expired_entry:
+            # A key that ran out of time is a different failure from a wrong
+            # key, and the caller can only fix it if the reply says which.
+            return self._error(403, self._expired_key_message(self.expired_entry),
+                               "invalid_request_error")
         # Say how a key must be presented, so a key that merely looks identical
         # (masked copy, trailing whitespace) is diagnosable straight from the
         # client error. Deliberately does not echo key names or values.
@@ -4981,6 +5008,24 @@ class Handler(BaseHTTPRequestHandler):
                                            "invalid_request_error")
                 else:
                     models = list((existing.get(entry_id) or {}).get("models") or [])
+                # Same rule as `models`: a row that does not carry the field
+                # keeps the stored deadline, so an older panel build cannot
+                # strip it and hand the key unlimited validity.
+                if "expires_at" in item:
+                    raw_expiry = item.get("expires_at")
+                    if raw_expiry in (None, "", False):
+                        expires_at = 0
+                    else:
+                        try:
+                            expires_at = int(float(raw_expiry))
+                        except (TypeError, ValueError):
+                            return self._error(400, "expires_at must be a unix timestamp",
+                                               "invalid_request_error")
+                        if expires_at < 0:
+                            return self._error(400, "expires_at must not be negative",
+                                               "invalid_request_error")
+                else:
+                    expires_at = int((existing.get(entry_id) or {}).get("expires_at") or 0)
                 created_at = item.get("created_at") or (existing.get(entry_id, {}).get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
@@ -4988,6 +5033,7 @@ class Handler(BaseHTTPRequestHandler):
                     "key": value,
                     "realm": realm,
                     "models": models,
+                    "expires_at": expires_at,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
                 })

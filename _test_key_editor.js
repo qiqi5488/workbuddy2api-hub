@@ -1,16 +1,21 @@
-/* Drive the dashboard's per-key model picker in Node.
+/* Drive the dashboard's per-key editor controls in Node.
  *
- * The picker is the only place an operator can restrict a key's models, so its
- * two failure modes both matter: a stored restriction that fails to render as
- * checked silently widens the key on the next save, and a model offered by the
- * exit on screen but stored on the key must not be dropped from the row.
+ * Covers the two restrictions an operator sets per key, both of which fail
+ * silently if the panel gets them wrong:
+ *
+ *   - the model allowlist: a restriction that fails to render as checked
+ *     widens the key on the next save, and a model stored on the key but
+ *     absent from the exit on screen must not be dropped from the row;
+ *   - the validity deadline: a deadline that renders in the wrong timezone,
+ *     or that is read back as 0, either expires a key early or grants it
+ *     unlimited life.
  *
  * The dashboard itself is loaded from the file next to this test, so the
  * assertions run against the shipped code, not a copy of it.
  *
  * Requires node (no other dependency); the rest of the suite is Python only.
  *
- *   node _test_key_model_picker.js
+ *   node _test_key_editor.js
  */
 const path = require('path');
 const fs = require('fs');
@@ -69,6 +74,14 @@ try {
         readKeyModels,
         onKeyModelToggle,
         toggleAllKeyModels,
+        toLocalInput,
+        fromLocalInput,
+        setKeyExpiry,
+        setKeyExpiryIn,
+        readKeyExpiry,
+        expiryText,
+        keyIsExpired,
+        expiryBadge,
         setRows: (r) => { API_KEY_ROWS = r; },
         setModels: (ids) => { MODELS_DATA = ids.map(id => ({ id })); },
       };`)();
@@ -179,6 +192,99 @@ api.setRows([{ models: ['stored'] }]);
 check('a stored model still renders even with nothing loaded',
       idsOf(api.modelChoicesHtml(0, { models: ['stored'] })).join(',') === 'stored',
       api.modelChoicesHtml(0, { models: ['stored'] }));
+
+console.log();
+console.log('[8] the expiry field round-trips local time, not UTC');
+
+// A datetime-local value is read as the operator's wall clock. Round-tripping
+// has to land on the same instant whatever the machine's zone is, or a key
+// expires hours early or late.
+const stampSec = 1893456000; // 2030-01-01T00:00:00Z
+const local = api.toLocalInput(stampSec);
+check('a deadline renders as a datetime-local value',
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(local), local);
+check('and reads back to the same instant', api.fromLocalInput(local) === stampSec,
+      [local, api.fromLocalInput(local)]);
+check('the rendered value is the local wall clock, not UTC',
+      local.slice(0, 10) === new Date(stampSec * 1000).toLocaleDateString('en-CA'),
+      [local, new Date(stampSec * 1000).toLocaleDateString('en-CA')]);
+check('no deadline renders as empty (the 永久有效 state)', api.toLocalInput(0) === '');
+check('an empty field reads back as "never"', api.fromLocalInput('') === 0);
+check('a garbage field reads back as "never", not as "now"',
+      api.fromLocalInput('not-a-date') === 0, api.fromLocalInput('not-a-date'));
+
+console.log();
+console.log('[9] the editor writes and reads the field');
+
+detached.clear();
+api.setRows([{ expires_at: 0 }]);
+api.setKeyExpiry(0, stampSec);
+check('setting a deadline fills the input',
+      els['editKeyExpiry_0'].value === api.toLocalInput(stampSec), els['editKeyExpiry_0'].value);
+check('and reads back as the same instant', api.readKeyExpiry(0) === stampSec,
+      api.readKeyExpiry(0));
+api.setKeyExpiry(0, 0);
+check('the 永久 button clears the input', els['editKeyExpiry_0'].value === '');
+check('which reads back as "never"', api.readKeyExpiry(0) === 0, api.readKeyExpiry(0));
+
+// The quick presets must land on the requested number of days from now.
+// datetime-local carries minutes, not seconds, so the round trip through the
+// input intentionally shaves off up to 59s - hence the 60s tolerance.
+const before = Math.floor(Date.now() / 1000);
+api.setKeyExpiryIn(0, 7);
+const got = api.readKeyExpiry(0);
+check('the 7-day preset is 7 days out',
+      Math.abs(got - (before + 7 * 86400)) <= 60, [got - before]);
+api.setKeyExpiryIn(0, 1);
+check('the 1-day preset is 1 day out',
+      Math.abs(api.readKeyExpiry(0) - (before + 86400)) <= 60,
+      api.readKeyExpiry(0) - before);
+
+// A row opened from storage with a deadline must show it, not blank it.
+api.setRows([{ expires_at: stampSec }]);
+delete els['editKeyExpiry_1'];
+api.setKeyExpiry(1, stampSec);
+check('an existing deadline is shown when the row is opened',
+      els['editKeyExpiry_1'].value === api.toLocalInput(stampSec),
+      els['editKeyExpiry_1'].value);
+// With no input on the page, the read must fall back to the stored value
+// rather than report 0 - that would silently make the key permanent.
+detached.add('editKeyExpiry_3');
+api.setRows([{}, {}, {}, { expires_at: stampSec }]);
+check('a missing input falls back to the stored deadline',
+      api.readKeyExpiry(3) === stampSec, api.readKeyExpiry(3));
+api.setRows([{}, {}, {}, { expires_at: 0 }]);
+check('a missing input on a permanent key stays "never"',
+      api.readKeyExpiry(3) === 0, api.readKeyExpiry(3));
+
+console.log();
+console.log('[10] an expired key is shown as such, and never counted as live');
+
+const nowSec = Math.floor(Date.now() / 1000);
+check('a past deadline is expired', api.keyIsExpired({ expires_at: nowSec - 60 }));
+check('the exact deadline is expired', api.keyIsExpired({ expires_at: nowSec }));
+check('a future deadline is not', !api.keyIsExpired({ expires_at: nowSec + 3600 }));
+check('no deadline never expires', !api.keyIsExpired({ expires_at: 0 }));
+check('a missing field never expires', !api.keyIsExpired({}));
+check('the server verdict wins even if the clocks disagree',
+      api.keyIsExpired({ expires_at: nowSec + 86400, expired: true }));
+check('null rows are safe', !api.keyIsExpired(null));
+
+check('an expired key gets the red 已过期 badge',
+      api.expiryBadge({ expires_at: nowSec - 60 }).indexOf('已过期') !== -1,
+      api.expiryBadge({ expires_at: nowSec - 60 }));
+check('a live key shows when it lapses',
+      api.expiryBadge({ expires_at: nowSec + 86400 }).indexOf('有效至') !== -1,
+      api.expiryBadge({ expires_at: nowSec + 86400 }));
+check('a key with no deadline reads 永久有效',
+      api.expiryBadge({ expires_at: 0 }).indexOf('永久有效') !== -1,
+      api.expiryBadge({ expires_at: 0 }));
+check('the badge escapes its content',
+      api.expiryBadge({ expires_at: 0 }).indexOf('<script') === -1);
+
+check('the human text names the moment', /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/.test(
+        api.expiryText(stampSec)), api.expiryText(stampSec));
+check('no deadline has no text', api.expiryText(0) === '');
 
 console.log();
 console.log('PASS=%d FAIL=%d', PASS, FAIL);

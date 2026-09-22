@@ -1034,9 +1034,12 @@ function updateUI(){
 
   // 计算当前绑定与生效的 Key 数量
   const keys = (typeof API_KEY_ROWS !== 'undefined' && API_KEY_ROWS.length) ? API_KEY_ROWS : (window.API_KEY_ROWS || []);
-  const intlKeys = keys.filter(k => k.enabled !== false && k.realm === 'intl').length;
-  const cnKeys = keys.filter(k => k.enabled !== false && k.realm === 'cn').length;
-  const followKeys = keys.filter(k => k.enabled !== false && !k.realm).length;
+  // An expired key is still configured but no longer usable, so it must not
+  // inflate the "生效" counters - the operator would think a client still works.
+  const liveKeys = keys.filter(k => k.enabled !== false && !keyIsExpired(k));
+  const intlKeys = liveKeys.filter(k => k.realm === 'intl').length;
+  const cnKeys = liveKeys.filter(k => k.realm === 'cn').length;
+  const followKeys = liveKeys.filter(k => !k.realm).length;
   const activeKeysTotal = isIntlGw ? (intlKeys + followKeys) : (cnKeys + followKeys);
 
   const elGwKeyBadge = document.getElementById("activeGatewayKeyCount");
@@ -2394,9 +2397,12 @@ async function loadSettings(showToast){
     }
     const keyState = document.getElementById('setKeyState');
     if(keyState){
-      const count = (data.api_keys || []).filter(k => k.enabled).length;
-      keyState.textContent = count ? ('(' + count + ' 个生效)') : '(当前不校验)';
-      keyState.style.color = count ? 'var(--accent2)' : 'var(--dim)';
+      const rows = data.api_keys || [];
+      const count = rows.filter(k => k.enabled && !keyIsExpired(k)).length;
+      const expired = rows.filter(k => k.enabled && keyIsExpired(k)).length;
+      keyState.textContent = (count ? ('(' + count + ' 个生效') : '(当前不校验)')
+        + (expired ? ('，' + expired + ' 个已过期') : '');
+      keyState.style.color = expired ? 'var(--warn)' : (count ? 'var(--accent2)' : 'var(--dim)');
     }
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
@@ -2411,6 +2417,9 @@ async function loadSettings(showToast){
       realm: k.realm || '',
       // Empty means "every model"; the picker treats it as unrestricted.
       models: (k.models || []).slice(),
+      // 0 means "never expires".
+      expires_at: k.expires_at || 0,
+      expired: k.expired === true,
       enabled: k.enabled !== false,
       created_at: k.created_at || '',
       _editing: false,
@@ -2528,6 +2537,70 @@ function readKeyModels(index){
   return out;
 }
 
+/* ---- per-key expiry ----
+   Stored as a unix timestamp so the gateway can compare it against its own
+   clock on every request; the panel edits it in local time, which is what the
+   operator reads off a calendar. 0 means "永久有效". */
+function pad2(n){ return String(n).padStart(2, '0'); }
+
+function toLocalInput(epochSec){
+  if(!epochSec) return '';
+  const d = new Date(epochSec * 1000);
+  if(isNaN(d.getTime())) return '';
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())
+    + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+function fromLocalInput(value){
+  if(!value) return 0;
+  const t = new Date(value).getTime();
+  if(isNaN(t)) return 0;
+  return Math.floor(t / 1000);
+}
+
+function setKeyExpiry(index, epochSec){
+  const el = document.getElementById('editKeyExpiry_' + index);
+  if(el) el.value = epochSec ? toLocalInput(epochSec) : '';
+}
+
+function setKeyExpiryIn(index, days){
+  setKeyExpiry(index, Math.floor(Date.now() / 1000) + days * 86400);
+}
+
+function readKeyExpiry(index){
+  const el = document.getElementById('editKeyExpiry_' + index);
+  if(!el) return (API_KEY_ROWS[index] || {}).expires_at || 0;
+  return fromLocalInput(el.value);
+}
+
+function expiryText(epochSec){
+  // "" rather than a label: the badge owns the "永久有效" wording, and a
+  // formatter that invents display text for "no value" cannot be reused
+  // anywhere the caller needs to tell "never" from "formatted".
+  if(!epochSec) return '';
+  const d = new Date(epochSec * 1000);
+  if(isNaN(d.getTime())) return '无效时间';
+  return d.getFullYear() + '/' + pad2(d.getMonth() + 1) + '/' + pad2(d.getDate())
+    + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+function keyIsExpired(row){
+  if(!row) return false;
+  const at = row.expires_at || 0;
+  if(!at) return false;
+  // The server's verdict is authoritative (its clock is the one that counts);
+  // the local comparison only makes the state flip while the page is open.
+  if(row.expired === true) return true;
+  return at * 1000 <= Date.now();
+}
+
+function expiryBadge(row){
+  const at = (row && row.expires_at) || 0;
+  if(!at) return '<span class="badge" style="font-size:11px">永久有效</span>';
+  if(keyIsExpired(row)) return '<span class="badge bad" style="font-size:11px">已过期</span>';
+  return '<span class="badge warn" style="font-size:11px">有效至 ' + esc(expiryText(at)) + '</span>';
+}
+
 function renderKeyRows(){
   const box = document.getElementById('keyList');
   if(!box) return;
@@ -2568,6 +2641,19 @@ function renderKeyRows(){
         +     modelChoicesHtml(i, row)
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
+        +     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
+        +       '<div style="font-size:12px;color:var(--dim);font-weight:500">有效期 <span style="color:var(--dim-light)">(留空 = 永久有效；到期后该 Key 自动失效)</span></div>'
+        +       '<div style="display:flex;gap:6px">'
+        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="setKeyExpiryIn(' + i + ', 1)">1 天</button>'
+        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="setKeyExpiryIn(' + i + ', 7)">7 天</button>'
+        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="setKeyExpiryIn(' + i + ', 30)">30 天</button>'
+        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="setKeyExpiry(' + i + ', 0)">永久</button>'
+        +       '</div>'
+        +     '</div>'
+        +     '<input type="datetime-local" id="editKeyExpiry_' + i + '" value="' + esc(toLocalInput(row.expires_at)) + '" '
+        +       'style="width:100%;max-width:320px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
+        +   '</div>'
+        +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">API Key 内容 ' + (row.masked ? '<span style="color:var(--dim-light)">(已保存: ' + esc(row.masked) + '，留空表示不改)</span>' : '') + '</div>'
         +     '<div style="display:flex;gap:8px">'
         +       '<input type="text" id="editKeyValue_' + i + '" value="' + esc(row.key || '') + '" placeholder="' + (row.masked ? '留空表示保持原 Key 不变' : '输入自定义密钥，或点击右侧生成') + '" '
@@ -2598,6 +2684,8 @@ function renderKeyRows(){
       ? '<span class="badge s" style="font-size:11px" title="' + esc((row.models || []).join(', ')) + '">限 ' + modelCount + ' 个模型</span>'
       : '<span class="badge" style="font-size:11px">全部模型</span>';
 
+    const expBadge = expiryBadge(row);
+
     const displayKey = row.masked || (row.key ? (row.key.slice(0, 4) + '******' + row.key.slice(-4)) : '未设置');
     const createdStr = row.created_at ? ('创建时间 ' + esc(row.created_at)) : '';
 
@@ -2609,6 +2697,7 @@ function renderKeyRows(){
       +       statusBadge
       +       realmBadge
       +       modelBadge
+      +       expBadge
       +     '</div>'
       +     '<div style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
@@ -2660,6 +2749,7 @@ async function saveSingleKey(index, btn){
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
   const models = readKeyModels(index);
+  const expiresAt = readKeyExpiry(index);
 
   if(!keyVal && !row.masked){
     toast('API Key 不能为空', 'warn');
@@ -2669,6 +2759,8 @@ async function saveSingleKey(index, btn){
   row.name = name || '未命名';
   row.realm = realm;
   row.models = models;
+  row.expires_at = expiresAt;
+  row.expired = expiresAt > 0 && expiresAt * 1000 <= Date.now();
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -2713,6 +2805,7 @@ function addApiKeyRow(){
     key: randomKeyValue(),
     realm: '',
     models: [],
+    expires_at: 0,
     enabled: true,
     masked: '',
     _editing: true
@@ -2776,6 +2869,7 @@ async function saveApiKeys(btn){
     name: row.name || '',
     realm: row.realm || '',
     models: row.models || [],
+    expires_at: row.expires_at || 0,
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
