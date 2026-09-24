@@ -213,6 +213,23 @@ def key_expiry_text(entry):
     return time.strftime("%Y/%m/%d %H:%M", time.localtime(expires_at))
 
 
+def _clean_key_token_limit(value):
+    """Normalize one key's cumulative token cap; 0 means "unlimited".
+
+    A negative or unparseable value is refused by the panel before it ever
+    reaches storage, so a value that does get here is already a non-negative
+    integer; this just makes a hand-edited file degrade to "unlimited" rather
+    than crashing the read.
+    """
+    if value in (None, "", False):
+        return 0
+    try:
+        limit = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return limit if limit > 0 else 0
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -230,6 +247,7 @@ def _clean_key_entry(entry):
         "realm": realm,
         "models": _clean_key_models(entry.get("models")),
         "expires_at": _clean_key_expiry(entry.get("expires_at")),
+        "token_limit": _clean_key_token_limit(entry.get("token_limit")),
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
     }
@@ -307,6 +325,7 @@ def api_keys(accounts_dir):
                 "realm": "",
                 "models": [],
                 "expires_at": 0,
+                "token_limit": 0,
                 "enabled": True,
             }]
     return []
@@ -364,6 +383,7 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
                 "realm": "",
                 "models": [],
                 "expires_at": 0,
+                "token_limit": 0,
                 "expired": False,
                 "enabled": True,
                 "source": "launcher",

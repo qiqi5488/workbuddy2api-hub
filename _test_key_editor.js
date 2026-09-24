@@ -82,6 +82,9 @@ try {
         expiryText,
         keyIsExpired,
         expiryBadge,
+        fmtTokens,
+        tokenBadge,
+        readKeyTokenLimit,
         setRows: (r) => { API_KEY_ROWS = r; },
         setModels: (ids) => { MODELS_DATA = ids.map(id => ({ id })); },
       };`)();
@@ -285,6 +288,58 @@ check('the badge escapes its content',
 check('the human text names the moment', /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/.test(
         api.expiryText(stampSec)), api.expiryText(stampSec));
 check('no deadline has no text', api.expiryText(0) === '');
+
+console.log();
+console.log('[11] the token limit badge reads the server\'s used count');
+
+check('a key with no limit and no usage reads 不限',
+      api.tokenBadge({ token_limit: 0, token_used: 0 }).indexOf('Token 不限') !== -1,
+      api.tokenBadge({ token_limit: 0, token_used: 0 }));
+check('a key with no limit but some usage still shows the used count',
+      api.tokenBadge({ token_limit: 0, token_used: 12345 }).indexOf('Token 已用') !== -1,
+      api.tokenBadge({ token_limit: 0, token_used: 12345 }));
+check('a key under its cap shows used/limit without the exhausted mark',
+      (api.tokenBadge({ token_limit: 500, token_used: 400 }).indexOf('400') !== -1)
+      && api.tokenBadge({ token_limit: 500, token_used: 400 }).indexOf('已用尽') === -1,
+      api.tokenBadge({ token_limit: 500, token_used: 400 }));
+check('a key at its cap is flagged exhausted',
+      api.tokenBadge({ token_limit: 500, token_used: 500 }).indexOf('已用尽') !== -1,
+      api.tokenBadge({ token_limit: 500, token_used: 500 }));
+check('a key over its cap is flagged exhausted too',
+      api.tokenBadge({ token_limit: 500, token_used: 600 }).indexOf('已用尽') !== -1,
+      api.tokenBadge({ token_limit: 500, token_used: 600 }));
+
+check('token numbers are abbreviated for display',
+      api.fmtTokens(1234).indexOf('k') !== -1 && api.fmtTokens(1500000).indexOf('M') !== -1,
+      [api.fmtTokens(1234), api.fmtTokens(1500000)]);
+check('small token counts stay exact', api.fmtTokens(42) === '42', api.fmtTokens(42));
+
+console.log();
+console.log('[12] the token limit input reads a non-negative integer');
+
+detached.clear();
+api.setRows([{ token_limit: 0 }]);
+els['editKeyTokenLimit_0'] = mkEl('editKeyTokenLimit_0');
+els['editKeyTokenLimit_0'].value = '123456';
+check('a typed limit is read back', api.readKeyTokenLimit(0) === 123456,
+      api.readKeyTokenLimit(0));
+els['editKeyTokenLimit_0'].value = '';
+check('an empty field means unlimited', api.readKeyTokenLimit(0) === 0,
+      api.readKeyTokenLimit(0));
+els['editKeyTokenLimit_0'].value = 'garbage';
+check('a non-numeric field means unlimited', api.readKeyTokenLimit(0) === 0,
+      api.readKeyTokenLimit(0));
+els['editKeyTokenLimit_0'].value = '-5';
+check('a negative field means unlimited', api.readKeyTokenLimit(0) === 0,
+      api.readKeyTokenLimit(0));
+
+api.setRows([{ token_limit: 999 }]);
+detached.add('editKeyTokenLimit_0');
+check('a missing input falls back to the stored limit',
+      api.readKeyTokenLimit(0) === 999, api.readKeyTokenLimit(0));
+api.setRows([{ token_limit: 0 }]);
+check('a missing input on an unlimited key stays 0',
+      api.readKeyTokenLimit(0) === 0, api.readKeyTokenLimit(0));
 
 console.log();
 console.log('PASS=%d FAIL=%d', PASS, FAIL);

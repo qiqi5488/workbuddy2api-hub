@@ -230,6 +230,77 @@ def _empty_stats():
             "gen_ms_sum": 0, "gen_samples": 0,
             "wall_ms_sum": 0, "wall_samples": 0}
 _usage = _empty_stats()
+
+# ---------------------------------------------------------------- key tokens
+# Cumulative total_tokens consumed by each API key, for enforcing the per-key
+# `token_limit`. Kept in memory for an O(1) check on the hot path and mirrored
+# to a small JSON file so a restart does not reset anyone's spent count. A
+# separate file (not settings.json) because the counter changes on every
+# completed request and must never clobber a concurrent panel save.
+_key_tokens = {}
+_key_tokens_lock = threading.Lock()
+
+
+def _key_tokens_path():
+    return os.path.join(ACCOUNTS_DIR, "key_tokens.json")
+
+
+def load_key_tokens():
+    """Read the persisted per-key totals; an absent or broken file means zero."""
+    global _key_tokens
+    try:
+        with open(_key_tokens_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            _key_tokens = {str(k): int(v or 0) for k, v in data.items()}
+            return
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("key tokens load failed: %s" % exc)
+    _key_tokens = {}
+
+
+def _persist_key_tokens():
+    try:
+        os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+        path = _key_tokens_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_key_tokens, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        log("key tokens persist failed: %s" % exc)
+
+
+def key_token_usage(key_id):
+    """Tokens already consumed by a key; 0 when the id is unknown."""
+    if not key_id:
+        return 0
+    with _key_tokens_lock:
+        return _key_tokens.get(str(key_id), 0)
+
+
+def key_token_add(key_id, tokens):
+    """Add tokens consumed by a key; persists and returns the new total."""
+    if not key_id or not tokens:
+        return key_token_usage(key_id)
+    with _key_tokens_lock:
+        key_id = str(key_id)
+        total = _key_tokens.get(key_id, 0) + int(tokens)
+        _key_tokens[key_id] = total
+        _persist_key_tokens()
+        return total
+
+
+def key_token_reset(key_id):
+    """Zero a key's spent count (a deliberate operator action)."""
+    if not key_id:
+        return
+    with _key_tokens_lock:
+        _key_tokens.pop(str(key_id), None)
+        _persist_key_tokens()
+
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
     if not usage:
@@ -317,7 +388,7 @@ def row_outcome(row):
         return o
     return "failed" if row.get("error") else "completed"
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
-                account=None, outcome="completed"):
+                account=None, outcome="completed", key_id=None):
     """Record one finished request as exactly one JSONL row.
 
     A request without a usage block still gets a row (flagged usage_missing):
@@ -327,6 +398,10 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     outcome is the terminal state: completed / client_aborted /
     upstream_aborted / failed. It is deliberately not called status, because
     status already means the HTTP status code on error rows.
+
+    key_id attributes the spend to an API key so the per-key token_limit can be
+    enforced; it is only the identity of the key the client used, never a value
+    that lets anyone spend more.
     """
     fields = _extract_usage(usage) or {}
     usage_missing = not fields
@@ -347,6 +422,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row.update(fp)
     if account:
         row["account"] = account
+    if key_id:
+        row["key_id"] = key_id
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
     # Derived per-request rates (None-safe).
@@ -357,6 +434,10 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     if fields.get("prompt_tokens", 0) > 0:
         row["cache_hit_pct"] = round(fields.get("cached_tokens", 0) * 100.0
                                      / fields["prompt_tokens"], 1)
+    # Attribute the spend before the row is persisted, so a crash right after
+    # the reply still leaves the counter ahead of (or equal to) the file.
+    if key_id:
+        key_token_add(key_id, fields.get("total_tokens", 0) or 0)
     with _lock:
         _usage["requests"] += 1
         for k in USAGE_FIELDS:
@@ -407,7 +488,7 @@ def _persist_usage(row, fail_label):
 
 def record_error(model, status, message, elapsed_ms=None, account=None,
                  usage=None, stream=None, ttft_ms=None, gen_ms=None, fp=None,
-                 outcome="failed"):
+                 outcome="failed", key_id=None):
     """Record one failed request as exactly one JSONL row.
 
     Passing the account uid records which account the request was bound to, so
@@ -446,6 +527,11 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         row["account"] = account
         acc = POOL.get(account) if POOL else None
         row["realm"] = acc.realm if acc else CURRENT_REALM
+    if key_id:
+        row["key_id"] = key_id
+        # A stream that broke mid-flight still spent tokens upstream; count them
+        # toward the key's limit rather than letting a retry queue dodge it.
+        key_token_add(key_id, fields.get("total_tokens", 0) or 0)
     with _lock:
         _usage["errors"] += 1
         if elapsed_ms is not None:
@@ -1318,6 +1404,8 @@ def runtime_settings_view():
             "models": list(entry.get("models") or []),
             "expires_at": int(entry.get("expires_at") or 0),
             "expired": bool(wb_settings.key_is_expired(entry)),
+            "token_limit": int(entry.get("token_limit") or 0),
+            "token_used": key_token_usage(entry.get("id")),
             "enabled": entry.get("enabled", True) is not False,
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8 else "*" * len(raw),
             "source": entry.get("source") or "panel",
@@ -4382,6 +4470,9 @@ class Handler(BaseHTTPRequestHandler):
     def _key_realm(self):
         """Realm bound to the key this request used, or "" when unbound."""
         return (self.key_entry or {}).get("realm") or ""
+    def _key_id(self):
+        """The id of the key this request used, for spend attribution, or None."""
+        return (self.key_entry or {}).get("id") or None
     def _cross_realm_error(self, model, realm):
         """Explain a model/exit mismatch instead of letting upstream reject it.
         Sending gpt-6-astra to the domestic exit (or deepseek-v4-pro to the
@@ -4418,6 +4509,28 @@ class Handler(BaseHTTPRequestHandler):
         return ("模型 %s 不在「%s」允许的模型范围内。该 Key 目前只能使用：%s。"
                 "请改用列表内的模型，或在看板「设置」页为该 Key 调整模型范围。"
                 % (model, name, allowed or "（未配置）"))
+    def _token_limit_error(self):
+        """Reject a key that has spent its cumulative token budget; "" when fine.
+
+        The cap is a total across the key's whole life, not a window, so the
+        spent count is read from the persisted per-key counter. Enforced before
+        the upstream call so a spent key burns nothing more; the request that
+        tips the count over the limit is the last one that completes, which is
+        the same "best effort at request granularity" every quota system has.
+        """
+        entry = self.key_entry or {}
+        if not entry:
+            return ""
+        limit = int(entry.get("token_limit") or 0)
+        if limit <= 0:
+            return ""
+        used = key_token_usage(entry.get("id"))
+        if used < limit:
+            return ""
+        name = entry.get("name") or "当前 Key"
+        return ("API Key「%s」的 Token 额度已用尽（已用 %d / 上限 %d），已停止服务。"
+                "请更换 Key，或让管理员在看板「设置」页提高上限 / 重置用量。"
+                % (name, used, limit))
     def _banned_model_error(self, model):
         """被封鎖的模型直接報錯，不碰上游、不扣任何點數。"""
         if not is_model_banned(model):
@@ -4969,6 +5082,23 @@ class Handler(BaseHTTPRequestHandler):
                                                "invalid_request_error")
                 else:
                     expires_at = int((existing.get(entry_id) or {}).get("expires_at") or 0)
+                # Same "absent keeps the stored value" rule as models/expiry, so
+                # an older panel build cannot erase a token cap it never read.
+                if "token_limit" in item:
+                    raw_limit = item.get("token_limit")
+                    if raw_limit in (None, "", False):
+                        token_limit = 0
+                    else:
+                        try:
+                            token_limit = int(float(raw_limit))
+                        except (TypeError, ValueError):
+                            return self._error(400, "token_limit must be an integer",
+                                               "invalid_request_error")
+                        if token_limit < 0:
+                            return self._error(400, "token_limit must not be negative",
+                                               "invalid_request_error")
+                else:
+                    token_limit = int((existing.get(entry_id) or {}).get("token_limit") or 0)
                 created_at = item.get("created_at") or (existing.get(entry_id, {}).get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
@@ -4977,6 +5107,7 @@ class Handler(BaseHTTPRequestHandler):
                     "realm": realm,
                     "models": models,
                     "expires_at": expires_at,
+                    "token_limit": token_limit,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
                 })
@@ -5586,6 +5717,9 @@ class Handler(BaseHTTPRequestHandler):
             not_allowed = self._model_allowed_error(chat_req.get("model"))
             if not_allowed:
                 return self._error(400, not_allowed, "invalid_request_error")
+            over_budget = self._token_limit_error()
+            if over_budget:
+                return self._error(403, over_budget, "invalid_request_error")
             upstream, account = open_upstream(chat_req, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
@@ -5648,7 +5782,7 @@ class Handler(BaseHTTPRequestHandler):
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, account=account.uid,
-                         outcome="client_aborted")
+                         outcome="client_aborted", key_id=self._key_id())
             return
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
@@ -5657,7 +5791,7 @@ class Handler(BaseHTTPRequestHandler):
                          usage=holder.get("usage"), stream=True,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted")
+                         fp=fp, outcome="upstream_aborted", key_id=self._key_id())
             try:
                 self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
                 self.wfile.flush()
@@ -5668,7 +5802,7 @@ class Handler(BaseHTTPRequestHandler):
         record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
+                     fp=fp, account=account.uid, key_id=self._key_id())
         return
 
     def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None):
@@ -5682,7 +5816,7 @@ class Handler(BaseHTTPRequestHandler):
         wall = int((time.time() - t_start) * 1000)
         result = chat_to_response(chat_obj, model, custom_names, request_meta, namespace_map)
         record_usage(model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
-                     account=account.uid)
+                     account=account.uid, key_id=self._key_id())
         return self._json(200, result)
 
     def do_POST(self):
@@ -5691,6 +5825,17 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/settings/reset-token-usage":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            key_id = str(payload.get("id") or "").strip()
+            if not key_id:
+                return self._error(400, "id is required", "invalid_request_error")
+            key_token_reset(key_id)
+            return self._json(200, {"id": key_id, "token_used": 0})
         if path.startswith("/proxy/"):
             if not self._panel_ok():
                 return self._error(
@@ -5779,6 +5924,9 @@ class Handler(BaseHTTPRequestHandler):
             not_allowed = self._model_allowed_error(payload.get("model"))
             if not_allowed:
                 return self._error(400, not_allowed, "invalid_request_error")
+            over_budget = self._token_limit_error()
+            if over_budget:
+                return self._error(403, over_budget, "invalid_request_error")
             upstream, account = open_upstream(payload, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
@@ -5860,7 +6008,7 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
                              fp=fp, account=account.uid,
-                             outcome="client_aborted")
+                             outcome="client_aborted", key_id=self._key_id())
                 return
             except Exception as exc:
                 # Upstream quit mid-stream (timeout, incomplete read, ...).
@@ -5871,7 +6019,7 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, account=account.uid,
                             usage=last_usage, stream=True, ttft_ms=first_ms,
                             gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, outcome="upstream_aborted")
+                             fp=fp, outcome="upstream_aborted", key_id=self._key_id())
                 try:
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
@@ -5898,7 +6046,7 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, last_usage, stream=True,
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid)
+                         fp=fp, account=account.uid, key_id=self._key_id())
             return
 
     def _chat_nonstream_response(self, upstream, model, fp, account, t_start):
@@ -5915,7 +6063,7 @@ class Handler(BaseHTTPRequestHandler):
         record_usage(model, result.get("usage"), stream=False,
                      elapsed_ms=wall, ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
+                     fp=fp, account=account.uid, key_id=self._key_id())
         return self._json(200, result)
 
 def main():
@@ -6043,6 +6191,7 @@ def _bootstrap_runtime(args):
     POOL.load()
     POOL.apply_proxy_slots()
     load_persisted_realm()
+    load_key_tokens()
     global SCHEDULER
     from wb_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)

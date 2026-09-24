@@ -2429,6 +2429,9 @@ async function loadSettings(showToast){
       // 0 means "never expires".
       expires_at: k.expires_at || 0,
       expired: k.expired === true,
+      // 0 means "unlimited"; token_used comes straight from the server.
+      token_limit: k.token_limit || 0,
+      token_used: k.token_used || 0,
       enabled: k.enabled !== false,
       created_at: k.created_at || '',
       _editing: false,
@@ -2610,6 +2613,57 @@ function expiryBadge(row){
   return '<span class="badge warn" style="font-size:11px">有效至 ' + esc(expiryText(at)) + '</span>';
 }
 
+/* ---- per-key token limit ----
+   A cumulative cap on total tokens (input + output + thinking). 0 = 不限.
+   `token_used` is reported by the server from its persisted counter, so the
+   badge is the server's truth even if this page has been open for a while. */
+function fmtTokens(n){
+  n = Number(n || 0);
+  if(n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if(n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if(n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+function tokenBadge(row){
+  const limit = (row && row.token_limit) || 0;
+  const used = (row && row.token_used) || 0;
+  if(!limit){
+    return used
+      ? '<span class="badge" style="font-size:11px">Token 已用 ' + esc(fmtTokens(used)) + '</span>'
+      : '<span class="badge" style="font-size:11px">Token 不限</span>';
+  }
+  const exhausted = used >= limit;
+  return '<span class="badge ' + (exhausted ? 'bad' : 's')
+    + '" style="font-size:11px" title="已用 ' + used + ' / 上限 ' + limit + ' Token">Token '
+    + esc(fmtTokens(used)) + ' / ' + esc(fmtTokens(limit))
+    + (exhausted ? '（已用尽）' : '') + '</span>';
+}
+
+function readKeyTokenLimit(index){
+  const el = document.getElementById('editKeyTokenLimit_' + index);
+  if(!el) return (API_KEY_ROWS[index] || {}).token_limit || 0;
+  const v = parseInt(el.value, 10);
+  return (isNaN(v) || v < 0) ? 0 : v;
+}
+
+async function resetKeyTokenUsage(index){
+  const row = API_KEY_ROWS[index];
+  if(!row) return;
+  if(!row.id){
+    toast('请先保存这个 Key 再重置用量', 'warn');
+    return;
+  }
+  if(!confirm('将 Key [' + (row.name || '未命名') + '] 的 Token 用量计数清零？此操作不会改动额度上限。')) return;
+  try{
+    await postJSON('/settings/reset-token-usage', {id: row.id});
+    toast('已重置 Token 用量', 'ok');
+    await loadSettings();
+  }catch(e){
+    toast('重置失败: ' + e.message, 'bad');
+  }
+}
+
 function renderKeyRows(){
   const box = document.getElementById('keyList');
   if(!box) return;
@@ -2662,6 +2716,12 @@ function renderKeyRows(){
         +     '<input type="datetime-local" id="editKeyExpiry_' + i + '" value="' + esc(toLocalInput(row.expires_at)) + '" '
         +       'style="width:100%;max-width:320px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
         +   '</div>'
+        +   '<div>'
+        +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">Token 额度上限 <span style="color:var(--dim-light)">(0 = 不限)</span></div>'
+        +     '<input type="number" min="0" step="1" id="editKeyTokenLimit_' + i + '" value="' + (row.token_limit || '') + '" placeholder="累计总 Token，用满后自动停用" '
+        +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
+        +     (row.token_used ? ('<div style="font-size:11px;color:var(--dim);margin-top:4px">当前已用 ' + esc(fmtTokens(row.token_used)) + ' Token</div>') : '')
+        +   '</div>'
         +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">API Key 内容 ' + (row.masked ? '<span style="color:var(--dim-light)">(已保存: ' + esc(row.masked) + '，留空表示不改)</span>' : '') + '</div>'
         +     '<div style="display:flex;gap:8px">'
@@ -2694,6 +2754,7 @@ function renderKeyRows(){
       : '<span class="badge" style="font-size:11px">全部模型</span>';
 
     const expBadge = expiryBadge(row);
+    const tokBadge = tokenBadge(row);
 
     const displayKey = row.masked || (row.key ? (row.key.slice(0, 4) + '******' + row.key.slice(-4)) : '未设置');
     const createdStr = row.created_at ? ('创建时间 ' + esc(row.created_at)) : '';
@@ -2707,6 +2768,7 @@ function renderKeyRows(){
       +       realmBadge
       +       modelBadge
       +       expBadge
+      +       tokBadge
       +     '</div>'
       +     '<div style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
@@ -2717,6 +2779,7 @@ function renderKeyRows(){
       +     '<button class="key-action-btn" id="copyBtn' + i + '" onclick="copyKeyRow(' + i + ')">复制</button>'
       +     '<button class="key-action-btn" onclick="openEditKey(' + i + ')">编辑</button>'
       +     '<button class="key-action-btn" onclick="toggleKeyRow(' + i + ')">' + (row.enabled ? '禁用' : '启用') + '</button>'
+      +     '<button class="key-action-btn" onclick="resetKeyTokenUsage(' + i + ')">重置用量</button>'
       +     '<button class="key-action-btn danger" onclick="removeKeyRow(' + i + ')">删除</button>'
       +   '</div>'
       + '</div>'
@@ -2759,6 +2822,7 @@ async function saveSingleKey(index, btn){
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
   const models = readKeyModels(index);
   const expiresAt = readKeyExpiry(index);
+  const tokenLimit = readKeyTokenLimit(index);
 
   if(!keyVal && !row.masked){
     toast('API Key 不能为空', 'warn');
@@ -2770,6 +2834,7 @@ async function saveSingleKey(index, btn){
   row.models = models;
   row.expires_at = expiresAt;
   row.expired = expiresAt > 0 && expiresAt * 1000 <= Date.now();
+  row.token_limit = tokenLimit;
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -2815,6 +2880,8 @@ function addApiKeyRow(){
     realm: '',
     models: [],
     expires_at: 0,
+    token_limit: 0,
+    token_used: 0,
     enabled: true,
     masked: '',
     _editing: true
@@ -2879,6 +2946,7 @@ async function saveApiKeys(btn){
     realm: row.realm || '',
     models: row.models || [],
     expires_at: row.expires_at || 0,
+    token_limit: row.token_limit || 0,
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
