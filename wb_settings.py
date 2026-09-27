@@ -403,6 +403,33 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+def reserve_credits(accounts_dir):
+    """Global low-credit guard: an account at or below this balance stays idle.
+
+    Zero disables the guard, which keeps installs that predate the setting
+    behaving exactly as before.
+    """
+    try:
+        value = int(load(accounts_dir).get("reserve_credits") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def set_reserve_credits(accounts_dir, value):
+    """Persist the guard threshold. Returns the stored value."""
+    try:
+        value = int(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    value = max(0, value)
+    with _lock:
+        data = load(accounts_dir)
+        data["reserve_credits"] = value
+        save(accounts_dir, data)
+    return value
+
+
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")
 
 

@@ -172,15 +172,23 @@ class Account(object):
         self.path = path
         token = str(data.get("accessToken") or "")
         self.uid = str(data.get("uid") or jwt_uid(token))
-        self.nickname = str(data.get("nickname") or "")
+        # The CN desktop build stores its nickname as an encrypted envelope
+        # ({"$wbEncrypted": ...}) rather than plain text. Stringifying that would
+        # paint an entire dictionary into the account row, so anything that is not
+        # a plain string is dropped and the uid prefix is shown instead.
+        raw_nickname = data.get("nickname")
+        if isinstance(raw_nickname, str) and "$wbEncrypted" not in raw_nickname:
+            self.nickname = raw_nickname.strip()
+        else:
+            self.nickname = ""
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_token(token, self.domain))
         if not self.domain:
             self.domain = get_realm_config(self.realm)["domain"]
         self.platform = str(data.get("platform") or "CLI")
-        # 出站身分一律以 cli 開局：這是「預設 cli」的實際落點。
-        # 面板手動切換或 429 自動切換只影響這次執行；重啟就回到 cli。
-        self.product = wb_identity.PRODUCT_CLI
+        # 出站身分預設以 WorkBuddy 獨立桌面端 (workbuddy) 開局。
+        # 面板手動切換或 429 自動切換只影響這次執行；重啟就回到預設的 workbuddy 桌面端。
+        self.product = wb_identity.PRODUCT_DESKTOP
         self.saved_product = wb_identity.normalize_product(data.get("product"))
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
@@ -203,6 +211,12 @@ class Account(object):
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
         self.last_checkin = data.get("lastCheckin") or None
+        self.last_daily_chat = data.get("lastDailyChat") or None
+        # Low-credit guard: once the balance reaches this level the account
+        # stops being handed out, so it never drops to zero (a zero balance is
+        # what makes the upstream start sending nagging SMS). Resolved from the
+        # global setting by AccountPool.apply_reserve_credits(); 0 disables it.
+        self.reserve_credits = 0
         # Serialise token refresh and file writes. Request threads, /health,
         # dashboard polls and the scheduler can all reach refresh()/save() for
         # the same account at once; without a lock the upstream rotates the
@@ -210,6 +224,9 @@ class Account(object):
         # minted token can be overwritten by a stale snapshot.
         self._refresh_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # The dashboard snapshots this state while request threads update it.
+        # Keep it separate from _refresh_lock, which spans network requests.
+        self._throttle_lock = threading.Lock()
 
     def to_dict(self):
         return {
@@ -232,10 +249,28 @@ class Account(object):
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
             "lastCheckin": self.last_checkin,
+            "lastDailyChat": self.last_daily_chat,
         }
+
+    def _throttle_snapshot(self, now):
+        """Return one consistent view of account and per-model cooldowns."""
+        with self._throttle_lock:
+            error = self.last_error
+            deadline = self.cooldown_until
+            active = [(model, until) for model, until in self.model_cooldowns.items()
+                      if until > now]
+        active.sort(key=lambda pair: (pair[1], pair[0]))
+        models = [{"model": model, "expiresAt": int(until)} for model, until in active]
+        return error, deadline, models
+
+    def model_cooldowns_snapshot(self):
+        """Active model cooldowns, ordered by recovery time (epoch seconds)."""
+        return self._throttle_snapshot(time.time())[2]
 
     def public(self):
         exp = self.expires_at or jwt_exp(self.access_token)
+        now = time.time()
+        last_error, deadline, models = self._throttle_snapshot(now)
         return {
             "uid": self.uid,
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
@@ -251,14 +286,19 @@ class Account(object):
             "expiresAt": exp,
             "expiresIn": _human_delta(exp - time.time()) if exp else None,
             "hasRefreshToken": bool(self.refresh_token),
-            "lastError": self.last_error,
-            "inCooldown": self.cooldown_until > time.time(),
-            "cooldownFor": round(max(0.0, self.cooldown_until - time.time())) or None,
+            "lastError": last_error,
+            "inCooldown": deadline > now,
+            "cooldownFor": round(max(0.0, deadline - now)) or None,
+            "modelCooldowns": models,
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
+            "reserveCredits": int(self.reserve_credits or 0),
+            "reserveBlocked": self.reserve_blocked(),
             "lastCheckin": self.last_checkin,
+            "lastDailyChat": self.last_daily_chat,
             "canCheckin": self.realm == "cn",
+            "canDailyChat": self.realm == "intl",
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
         }
@@ -293,12 +333,35 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
+    def reserve_blocked(self):
+        """True when the low-credit guard should keep this account idle.
+
+        Only a *known* balance can block: an account whose credits were never
+        fetched stays usable, otherwise a fresh install would look empty.
+        """
+        reserve = int(self.reserve_credits or 0)
+        if reserve <= 0:
+            return False
+        credits = self.credits
+        if not isinstance(credits, dict):
+            return False
+        remain = credits.get("remain")
+        if remain is None:
+            return False
+        try:
+            remain = int(remain)
+        except (TypeError, ValueError):
+            return False
+        return remain <= reserve
+
     def ready(self, model=None):
         if not self.enabled or not self.access_token:
             return False
-        if self.cooldown_until > time.time():
+        if self.throttle_wait(model=model) > 0:
             return False
-        if model and self.model_cooldowns.get(model, 0.0) > time.time():
+        # Parked below the reserve: serving a request here is what would push
+        # the balance to zero and trigger the upstream reminder SMS.
+        if self.reserve_blocked():
             return False
         exp = self.expires_at or jwt_exp(self.access_token)
         if not exp:
@@ -399,7 +462,7 @@ class Account(object):
 
     def _refresh_locked(self):
         if not self.refresh_token:
-            self.last_error = "no refresh token; sign in again"
+            self._set_last_error("no refresh token; sign in again")
             return False
         cfg = get_realm_config(self.realm)
         url = cfg["chat_upstream"] + REFRESH_PATH
@@ -423,19 +486,20 @@ class Account(object):
             payload = http_json(url, data=b"{}", method="POST", headers=headers, timeout=30,
                                 proxy=self.proxy)
         except Exception as exc:
-            self.last_error = "refresh failed: %s" % exc
+            self._set_last_error("refresh failed: %s" % exc)
             return False
         data = (payload.get("data") or {})
         data = data.get("data") or data
         token = data.get("accessToken")
         if not token:
-            self.last_error = "refresh returned no token (%s)" % payload.get("msg")
+            self._set_last_error("refresh returned no token (%s)" % payload.get("msg"))
             return False
         self.access_token = token
         self.refresh_token = data.get("refreshToken") or self.refresh_token
         self.expires_at = jwt_exp(token) or self.expires_at
-        self.last_error = ""
-        self.cooldown_until = 0
+        with self._throttle_lock:
+            self.last_error = ""
+            self.cooldown_until = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         return True
@@ -447,6 +511,51 @@ class Account(object):
             return True
         today_str = time.strftime("%Y-%m-%d")
         return not str(self.last_checkin).startswith(today_str)
+
+    def can_daily_chat(self):
+        if self.realm != "intl":
+            return False
+        if not self.last_daily_chat:
+            return True
+        today_str = time.strftime("%Y-%m-%d")
+        return not str(self.last_daily_chat).startswith(today_str)
+
+    def daily_chat(self):
+        """国际版每日活跃对话（满足官方客户端每日对话送 30/50 积分活跃奖励规则）。"""
+        if self.realm != "intl":
+            return {"ok": False, "error": "daily chat is only for international accounts"}
+        import wb_proxy
+        url = self.chat_base_url() + wb_proxy.CHAT_PATH
+        headers = self.headers("chat")
+        body = {
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "max_tokens": 10,
+            "reasoning_effort": "none",
+        }
+        req_body = wb_proxy.build_upstream_body(body)
+        data = json.dumps(req_body, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=20, proxy=self.proxy) as resp:
+                _ = resp.read()
+            self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+            if self.path and os.path.exists(os.path.dirname(self.path)):
+                self.save(os.path.dirname(self.path))
+            try:
+                self.fetch_credits()
+            except Exception:
+                pass
+            return {"ok": True, "msg": "每日活跃对话成功完成"}
+        except urllib.error.HTTPError as exc:
+            try:
+                err = exc.read().decode("utf-8", "replace")
+            except Exception:
+                err = str(exc)
+            return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def checkin(self):
         if self.realm != "cn":
@@ -523,35 +632,43 @@ class Account(object):
             self.save(os.path.dirname(self.path))
         return {"ok": True, "credits": self.credits}
 
+    def _set_last_error(self, message):
+        """Record refresh errors alongside the state shown in the panel."""
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None):
-        self.last_error = str(message)[:200]
-        if model:
-            # Model-scoped throttle: keep the account usable for every other model.
-            wait = max(1.0, float(until) - time.time()) if until else (
-                3.0 if single_account else float(cooldown))
-            self.model_cooldowns[model] = time.time() + wait
-            return
-        actual_cooldown = 3 if single_account else cooldown
-        self.cooldown_until = time.time() + actual_cooldown
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+            if model:
+                # Model-scoped throttle: keep the account usable for every other model.
+                wait = max(1.0, float(until) - time.time()) if until else (
+                    3.0 if single_account else float(cooldown))
+                self.model_cooldowns[model] = time.time() + wait
+                return
+            actual_cooldown = 3 if single_account else cooldown
+            self.cooldown_until = time.time() + actual_cooldown
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
         if not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
-        wait = max(0.0, self.cooldown_until - now)
-        if model:
-            wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
+        with self._throttle_lock:
+            wait = max(0.0, self.cooldown_until - now)
+            if model:
+                wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
         return wait
 
     def clear_error(self, model=None):
-        if model:
-            self.model_cooldowns.pop(model, None)
-        else:
-            self.model_cooldowns.clear()
-        if self.last_error or self.cooldown_until:
-            self.last_error = ""
-            self.cooldown_until = 0
+        with self._throttle_lock:
+            if model:
+                self.model_cooldowns.pop(model, None)
+            else:
+                self.model_cooldowns.clear()
+            if self.last_error or self.cooldown_until:
+                self.last_error = ""
+                self.cooldown_until = 0
 
 def _human_delta(seconds):
     if seconds is None: return None
@@ -623,6 +740,7 @@ class AccountPool(object):
                         except Exception:
                             pass
                     self.accounts.append(account)
+            self.apply_reserve_credits()
             return self.accounts
 
     def list_public(self, realm=None):
@@ -646,6 +764,8 @@ class AccountPool(object):
                     account.credits = existing.credits
                 if not account.last_checkin and existing.last_checkin:
                     account.last_checkin = existing.last_checkin
+                if not account.last_daily_chat and existing.last_daily_chat:
+                    account.last_daily_chat = existing.last_daily_chat
                 if not account.proxy_slot and existing.proxy_slot:
                     account.proxy_slot = existing.proxy_slot
                 if not account.proxy_legacy and existing.proxy_legacy:
@@ -655,6 +775,7 @@ class AccountPool(object):
                 self.accounts.append(account)
             account.save(self.dir)
             self.apply_proxy_slots()
+            self.apply_reserve_credits()
             return account
 
     def remove(self, uid):
@@ -782,6 +903,26 @@ class AccountPool(object):
                     account.proxy = slot["url"]
                 else:
                     account.proxy = account.proxy_legacy
+
+    def apply_reserve_credits(self, value=None):
+        """Re-resolve the low-credit guard for every account.
+
+        Same shape as apply_proxy_slots(): settings.json is the source of
+        truth and the per-account value is derived here, so the request path
+        needs no extra settings lookup.
+        """
+        import wb_settings
+
+        if value is None:
+            value = wb_settings.reserve_credits(self.dir)
+        try:
+            value = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            value = 0
+        with self._lock:
+            for account in self.accounts:
+                account.reserve_credits = value
+        return value
 
     def set_proxy_slot(self, uid, slot_id):
         account = self.get(uid)
@@ -1090,7 +1231,7 @@ EXPORT_VERSION = 1
 # Fields that describe live state rather than the credential itself. They are
 # exported for inspection but never trusted on import: a stale cooldown or a
 # disabled flag from another machine would silently cripple the target pool.
-VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin")
+VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin", "lastDailyChat")
 
 
 def account_to_export(account):
