@@ -46,11 +46,22 @@ def tail(path):
 
 
 def main(argv):
+    # Echoing a failing suite's tail must not itself die on the console codepage:
+    # the tail is decoded as UTF-8, so the stream printing it has to accept it.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     if len(argv) > 1 and argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0
     pattern = argv[1] if len(argv) > 1 else ""
+    # The suites are not ASCII-only (the API-key ones print Chinese labels) and
+    # this log is read back as UTF-8 below, so pin the children to UTF-8 too.
+    # A Windows runner whose console codepage is cp1252 otherwise kills a suite
+    # with UnicodeEncodeError before it can assert anything.
     env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = os.pathsep.join(
         [ROOT] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     have_node = shutil.which("node") is not None
