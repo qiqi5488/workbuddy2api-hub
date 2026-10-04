@@ -5649,10 +5649,12 @@ class Handler(BaseHTTPRequestHandler):
         data = [model_entry(mid, meta) for mid, meta in entries]
         # A key restricted to specific models must only discover those, or a
         # client's model picker advertises models every call would then reject.
-        allowed = (self.key_entry or {}).get("models") or []
-        if allowed:
-            wanted = set(allowed)
-            data = [item for item in data if str(item.get("id") or "").lower() in wanted]
+        # Matched with the same rule the request guard uses, so a pattern like
+        # `deepseek*` lists exactly the models it would also let through.
+        entry = self.key_entry or {}
+        if entry.get("models"):
+            data = [item for item in data
+                    if wb_settings.key_allows_model(entry, item.get("id"))]
         return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
 
     def _get_v1_usage(self, query):

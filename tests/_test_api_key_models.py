@@ -289,6 +289,38 @@ try:
     by_id = {k.get("id"): k for k in view.get("api_keys") or []}
     check("and is split into patterns",
           by_id.get("k1", {}).get("models") == ["glm-5.3", "kimi-k3"], by_id.get("k1"))
+
+    print()
+    print("[8] a pattern-limited key discovers exactly what it may call")
+
+    # The listing and the request guard have to agree: a pattern that lets a
+    # call through but advertises nothing leaves the client's picker empty, and
+    # one that advertises a model every call would reject is just as wrong.
+    status, saved = request(port, "/settings/save", method="POST", panel_token=token,
+                            body={"api_keys": [
+                                {"id": "k1", "name": "restricted", "key": "",
+                                 "models": ["glm-5.3", "kimi-k3"]},
+                                {"id": "k3", "name": "pattern", "key": "KEYPATTERN",
+                                 "models": ["glm*"]},
+                            ]})
+    check("the pattern key saved", status == 200, (status, saved))
+
+    status, models = request(port, "/v1/models", key="KEYPATTERN")
+    ids = [m.get("id") for m in models.get("data") or []]
+    check("a wildcard lists the models it allows", bool(ids), ids)
+    check("and advertises nothing outside the pattern",
+          all(str(i).startswith("glm") for i in ids), ids)
+    check("a model the pattern covers is advertised", "glm-5.3" in ids, ids)
+    check("a model it does not cover is not", "kimi-k3" not in ids, ids)
+
+    status, err = request(port, "/v1/chat/completions", method="POST", key="KEYPATTERN",
+                          body={"model": "glm-5.3",
+                                "messages": [{"role": "user", "content": "hi"}]})
+    check("an advertised model is callable", status == 503, (status, err))
+    status, err = request(port, "/v1/chat/completions", method="POST", key="KEYPATTERN",
+                          body={"model": "kimi-k3",
+                                "messages": [{"role": "user", "content": "hi"}]})
+    check("an unadvertised one is refused when called", status == 400, (status, err))
 finally:
     proc.terminate()
     try:
