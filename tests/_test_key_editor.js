@@ -70,10 +70,6 @@ let api;
 try {
   api = new Function(code + `
     ; return {
-        modelChoicesHtml,
-        readKeyModels,
-        onKeyModelToggle,
-        toggleAllKeyModels,
         toLocalInput,
         fromLocalInput,
         setKeyExpiry,
@@ -86,7 +82,6 @@ try {
         tokenBadge,
         readKeyTokenLimit,
         setRows: (r) => { API_KEY_ROWS = r; },
-        setModels: (ids) => { MODELS_DATA = ids.map(id => ({ id })); },
       };`)();
 } catch (e) {
   console.log('LOAD ERROR:', e.message);
@@ -99,102 +94,6 @@ const check = (label, ok, extra) => {
   else { FAIL++; console.log('  [FAIL] ' + label + (extra !== undefined ? '  ' + JSON.stringify(extra) : '')); }
 };
 
-/* Parse the chips back out of the rendered HTML and wire each checkbox into
-   the fake DOM, mirroring what the browser would hand the handlers. */
-function mount(index, htmlText){
-  const box = els['editKeyModels_' + index] || (els['editKeyModels_' + index] = mkEl('editKeyModels_' + index));
-  box.innerHTML = htmlText;
-  box._boxes = [];
-  const re = /<input type="checkbox" data-model="([^"]*)"( checked)?[^>]*>/g;
-  let m;
-  while((m = re.exec(htmlText))){
-    const cb = mkEl('cb');
-    cb.checked = !!m[2];
-    cb.attrs['data-model'] = m[1];
-    const label = mkEl('label');
-    label.style = {};
-    cb._label = label;
-    box._boxes.push(cb);
-  }
-  return box;
-}
-
-const idsOf = (htmlText) => [...htmlText.matchAll(/data-model="([^"]*)"/g)].map(m => m[1]);
-const checkedIn = (htmlText) => [...htmlText.matchAll(/data-model="([^"]*)" checked/g)].map(m => m[1]);
-
-console.log('[1] the picker offers the models of the exit on screen');
-api.setModels(['deepseek-v4.1-flash', 'glm-5.3', 'gpt-6-astra']);
-let out = api.modelChoicesHtml(0, { models: [] });
-check('every loaded model is offered in order',
-      idsOf(out).join(',') === 'deepseek-v4.1-flash,glm-5.3,gpt-6-astra', idsOf(out));
-check('an unrestricted key renders nothing checked', checkedIn(out).length === 0,
-      checkedIn(out));
-
-console.log();
-console.log('[2] a stored restriction renders as checked');
-out = api.modelChoicesHtml(0, { models: ['glm-5.3'] });
-check('the stored model is checked', checkedIn(out).join(',') === 'glm-5.3', checkedIn(out));
-out = api.modelChoicesHtml(0, { models: ['GLM-5.3'] });
-check('matching ignores case, so the box is still ticked',
-      checkedIn(out).join(',') === 'glm-5.3', checkedIn(out));
-
-console.log();
-console.log('[3] a model stored on the key but absent from this exit survives');
-api.setModels(['deepseek-v4.1-flash']);
-out = api.modelChoicesHtml(0, { models: ['deepseek-v4.1-flash', 'gpt-6-astra'] });
-check('the other exit\'s model is still rendered',
-      idsOf(out).join(',') === 'deepseek-v4.1-flash,gpt-6-astra', idsOf(out));
-check('and is marked as belonging to the other exit', out.indexOf('(另一出口)') !== -1, out);
-check('and stays checked', checkedIn(out).join(',') === 'deepseek-v4.1-flash,gpt-6-astra',
-      checkedIn(out));
-
-console.log();
-console.log('[4] readKeyModels returns the ticked boxes, not the stored list');
-api.setModels(['a', 'b', 'c']);
-api.setRows([{ models: ['a'] }]);
-mount(0, api.modelChoicesHtml(0, { models: ['a'] }));
-check('nothing ticked yet beyond the stored one',
-      api.readKeyModels(0).join(',') === 'a', api.readKeyModels(0));
-els['editKeyModels_0']._boxes[2].checked = true;
-check('a newly ticked box is read back',
-      api.readKeyModels(0).join(',') === 'a,c', api.readKeyModels(0));
-els['editKeyModels_0']._boxes[0].checked = false;
-check('an unticked box is dropped', api.readKeyModels(0).join(',') === 'c',
-      api.readKeyModels(0));
-
-console.log();
-console.log('[5] the container is only trusted when it is actually on the page');
-// saveSingleKey reads the picker for a row that was just opened; a missing
-// container must fall back to the row's stored list rather than clear it.
-api.setRows([{ models: ['keep-me'] }]);
-delete els['editKeyModels_0'];
-detached.add('editKeyModels_0');
-api.setModels(['a']);
-check('a missing picker falls back to the stored list',
-      api.readKeyModels(0).join(',') === 'keep-me', api.readKeyModels(0));
-
-console.log();
-console.log('[6] 全选 / 清空 drive every box');
-detached.clear();
-api.setModels(['a', 'b', 'c']);
-mount(0, api.modelChoicesHtml(0, { models: [] }));
-check('nothing ticked before', api.readKeyModels(0).length === 0, api.readKeyModels(0));
-api.toggleAllKeyModels(0, true);
-check('全选 ticks every box', api.readKeyModels(0).join(',') === 'a,b,c',
-      api.readKeyModels(0));
-api.toggleAllKeyModels(0, false);
-check('清空 clears every box', api.readKeyModels(0).length === 0, api.readKeyModels(0));
-
-console.log();
-console.log('[7] an empty catalog says so instead of silently allowing everything');
-api.setModels([]);
-out = api.modelChoicesHtml(0, { models: [] });
-check('the empty state explains the fallback', out.indexOf('留空表示不限制') !== -1, out);
-check('no checkboxes are drawn', idsOf(out).length === 0, idsOf(out));
-api.setRows([{ models: ['stored'] }]);
-check('a stored model still renders even with nothing loaded',
-      idsOf(api.modelChoicesHtml(0, { models: ['stored'] })).join(',') === 'stored',
-      api.modelChoicesHtml(0, { models: ['stored'] }));
 
 console.log();
 console.log('[8] the expiry field round-trips local time, not UTC');

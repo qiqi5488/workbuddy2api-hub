@@ -12,6 +12,34 @@ import urllib.request
 import uuid
 from wb_fingerprint import derive_id, generate_request_id
 import wb_identity
+import wb_settings
+import wb_webagent
+
+# ---------------------------------------------------------------------------
+# 网页版通道（issue #75 / #59 / #90）
+#
+# 网页版 app 的「对话」不是 chat/completions，而是 console/as 下的 agent 会话。
+# 这条链路只用 Authorization: Bearer <accessToken> 与 X-User-Id 两个凭据头，
+# 没有桌面端的 X-IDE-* 指纹，所以网关手里同一份账号凭据可以直接用。
+#
+# 关键的一步（issue #90 实测）：建会话只是**排队**。agent 要等客户端接上这条
+# 会话的沙箱（GET .../{id}/session 返回的 link + token）并请求这一轮才会跑，
+# 否则会话永远停在 CREATING、没有任何输出，也就不算一次有效对话。网页端的顺序
+# 是 建会话 → 取 session → ACP over HTTP+SSE 的 initialize / session/load /
+# session/prompt（实现见 wb_webagent）。
+#
+# 每日活跃奖励认的是「跑完的 agent 会话」：桌面身分发 chat/completions 不计数
+# （issue #75、#59 实测），只建会话不接沙箱同样不计数（#90 实测）。因此国际版
+# 打卡在桌面端对话之外，再走一次这条网页通道，并且把它跑到 completed。
+# ---------------------------------------------------------------------------
+WEB_ORIGIN = "https://www.workbuddy.ai"
+WEB_CONVERSATIONS_URL = WEB_ORIGIN + "/console/as/conversations/"
+WEB_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0")
+DAILY_CHAT_MODEL = "deepseek-v4.1-flash"
+DAILY_CHAT_WEB_PROMPT = "Hi"
+#: 网页通道一轮最多等多久（秒）。实测一次「Hi」十几秒就跑完，留足余量。
+WEB_TURN_TIMEOUT = int(os.environ.get("WB_WEB_TURN_TIMEOUT") or "120")
 
 
 def _retryable(exc):
@@ -186,10 +214,12 @@ class Account(object):
         if not self.domain:
             self.domain = get_realm_config(self.realm)["domain"]
         self.platform = str(data.get("platform") or "CLI")
-        # 出站身分預設以 WorkBuddy 獨立桌面端 (workbuddy) 開局。
-        # 面板手動切換或 429 自動切換只影響這次執行；重啟就回到預設的 workbuddy 桌面端。
-        self.product = wb_identity.PRODUCT_DESKTOP
-        self.saved_product = wb_identity.normalize_product(data.get("product"))
+        # 出站身分讀回憑證檔裡保存的值：面板手動切換與 429 自動切換都會經由
+        # save() 寫進憑證檔（to_dict() 序列化的是當下身分），所以重啟後接著用
+        # 上次實際生效的那條通道，而不是每次都回到預設。
+        # 憑證檔沒有這個欄位、或值不合法時 normalize_product() 會回退到
+        # WorkBuddy 獨立桌面端 (workbuddy)，升級前就已存在的帳號行為不變。
+        self.product = wb_identity.normalize_product(data.get("product"))
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -217,6 +247,16 @@ class Account(object):
         # what makes the upstream start sending nagging SMS). Resolved from the
         # global setting by AccountPool.apply_reserve_credits(); 0 disables it.
         self.reserve_credits = 0
+        # Daily token guard: an account that already burned this many tokens
+        # today stops being handed out, so a client that would burn the rest
+        # of the day's quota rotates to another account instead of hitting
+        # the upstream wall. Resolved from the global setting by
+        # AccountPool.apply_daily_token_limit(); 0 disables it.
+        # daily_tokens_today stays None until the proxy has folded the usage
+        # log at least once, so a fresh process never parks anyone on an
+        # unknown count.
+        self.daily_token_limit = 0
+        self.daily_tokens_today = None
         # Serialise token refresh and file writes. Request threads, /health,
         # dashboard polls and the scheduler can all reach refresh()/save() for
         # the same account at once; without a lock the upstream rotates the
@@ -295,6 +335,11 @@ class Account(object):
             "credits": self.credits,
             "reserveCredits": int(self.reserve_credits or 0),
             "reserveBlocked": self.reserve_blocked(),
+            "dailyTokenLimit": int(self.daily_token_limit or 0),
+            "dailyTokensToday": (int(self.daily_tokens_today)
+                                 if isinstance(self.daily_tokens_today, int)
+                                 else None),
+            "dailyLimitBlocked": self.daily_limit_blocked(),
             "lastCheckin": self.last_checkin,
             "lastDailyChat": self.last_daily_chat,
             "canCheckin": self.realm == "cn",
@@ -354,6 +399,26 @@ class Account(object):
             return False
         return remain <= reserve
 
+    def daily_limit_blocked(self):
+        """True when today's counted usage has reached the configured limit.
+
+        Only a *counted* day can block: until the proxy has folded the usage
+        log once, the count is None and the account stays usable.
+        """
+        try:
+            limit = int(self.daily_token_limit or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
+            return False
+        used = self.daily_tokens_today
+        if used is None:
+            return False
+        try:
+            return int(used) >= limit
+        except (TypeError, ValueError):
+            return False
+
     def ready(self, model=None):
         if not self.enabled or not self.access_token:
             return False
@@ -362,6 +427,10 @@ class Account(object):
         # Parked below the reserve: serving a request here is what would push
         # the balance to zero and trigger the upstream reminder SMS.
         if self.reserve_blocked():
+            return False
+        # Today's token budget is spent: keep the seat for tomorrow instead
+        # of letting the upstream answer 429 for the rest of the day.
+        if self.daily_limit_blocked():
             return False
         exp = self.expires_at or jwt_exp(self.access_token)
         if not exp:
@@ -520,15 +589,115 @@ class Account(object):
         today_str = time.strftime("%Y-%m-%d")
         return not str(self.last_daily_chat).startswith(today_str)
 
-    def daily_chat(self):
-        """国际版每日活跃对话（满足官方客户端每日对话送 30/50 积分活跃奖励规则）。"""
+    def web_headers(self):
+        """网页版 app 的出站头：只有 bearer 与 X-User-Id，没有桌面端指纹。"""
+        return {
+            "Authorization": "Bearer " + self.access_token,
+            "X-User-Id": self.uid,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": WEB_ORIGIN,
+            "Referer": WEB_ORIGIN + "/app",
+            "User-Agent": WEB_USER_AGENT,
+        }
+
+    def daily_chat_web(self, prompt=None):
+        """网页通道的每日活跃会话（issue #75 / #59 / #90）。
+
+        只建会话是不够的：agent 要等客户端接上沙箱并请求这一轮才会跑，否则会话
+        永远停在 CREATING、没有任何输出，也就不算一次有效对话（#90 实测）。这里
+        按网页端的顺序走完：建会话 → 取沙箱 link+token → ACP 的 initialize /
+        session/load / session/prompt（见 wb_webagent）→ 轮询到 completed。
+
+        返回 {"ok": True, "conversation": id, "status": "completed", "chunks": n,
+        "elapsed_ms": n}，失败时 {"ok": False, "error": ...}（尽量带上会话 id）。
+        """
+        if self.realm != "intl":
+            return {"ok": False, "error": "web daily chat is only for international accounts"}
+        body = {
+            "prompt": prompt or DAILY_CHAT_WEB_PROMPT,
+            "model": DAILY_CHAT_MODEL,
+            # 网页端建会话时固定带上这两项（抓包所得），保持请求形态一致。
+            "conversationOrigin": "workbuddy-app",
+            "plugins": [{"name": "weixinpay", "marketplace": "codebuddy-builtin"}],
+        }
+        req = urllib.request.Request(
+            WEB_CONVERSATIONS_URL,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=self.web_headers(), method="POST")
+        try:
+            with urlopen(req, timeout=30, proxy=self.proxy) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", "replace")
+            except Exception:
+                detail = str(exc)
+            return {"ok": False, "error": "HTTP %d: %s" % (exc.code, detail[:120])}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "unexpected response"}
+        conversation = (payload.get("data") or {}).get("id")
+        if payload.get("code") not in (0, None) or not conversation:
+            return {"ok": False, "error": "code=%s msg=%s"
+                    % (payload.get("code"), payload.get("msg"))}
+
+        # 建完只是排队：接上沙箱、请求这一轮，它才会真的跑起来（issue #90）。
+        try:
+            session = (self._web_conversation_get(conversation, "/session") or {}).get("data") or {}
+        except Exception as exc:
+            return {"ok": False, "conversation": conversation,
+                    "error": "session 查询失败: %s" % exc}
+        link = session.get("link") or session.get("endpoint") or ""
+        token = session.get("token") or ""
+        session_id = session.get("sessionId") or session.get("session_id") or conversation
+        cwd = session.get("cwd") or "/workspace"
+        if not link or not token:
+            return {"ok": False, "conversation": conversation,
+                    "error": "沙箱未就绪（没有 link/token）"}
+
+        result = wb_webagent.run_turn(
+            link, token, session_id, cwd, prompt or DAILY_CHAT_WEB_PROMPT,
+            WEB_USER_AGENT,
+            poll_status=lambda: self._web_conversation_status(conversation),
+            wait_seconds=WEB_TURN_TIMEOUT, proxy=self.proxy)
+        result["conversation"] = conversation
+        if result.get("ok"):
+            result["msg"] = "网页通道会话跑完：%d 段输出，%d ms" % (
+                result.get("chunks") or 0, result.get("elapsed_ms") or 0)
+        return result
+
+    def _web_conversation_get(self, conversation, suffix=""):
+        """读一条网页端会话（suffix 为空拿会话本身，"/session" 拿沙箱信息）。"""
+        url = WEB_CONVERSATIONS_URL + urllib.parse.quote(str(conversation)) + suffix
+        req = urllib.request.Request(url, headers=self.web_headers(), method="GET")
+        with urlopen(req, timeout=30, proxy=self.proxy) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace") or "{}")
+
+    def _web_conversation_status(self, conversation):
+        """这条会话现在什么状态（completed 就是这一轮真的跑完了）。"""
+        try:
+            payload = self._web_conversation_get(conversation)
+        except Exception:
+            return ""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return str((data or {}).get("status") or "")
+
+    def daily_chat(self, web=None):
+        """国际版每日活跃对话（官方每日活跃 30/50 积分）。
+
+        两步：桌面端身分的轻量对话（一直以来的做法），以及网页通道的会话
+        （issue #75/#59/#90：算数的是「跑完的 agent 会话」）。web=None 时按
+        settings.json 里的 daily_chat_web 决定，True/False 可显式指定。
+        """
         if self.realm != "intl":
             return {"ok": False, "error": "daily chat is only for international accounts"}
         import wb_proxy
         url = self.chat_base_url() + wb_proxy.CHAT_PATH
         headers = self.headers("chat")
         body = {
-            "model": "deepseek-v4.1-flash",
+            "model": DAILY_CHAT_MODEL,
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": True,
             "max_tokens": 10,
@@ -547,7 +716,20 @@ class Account(object):
                 self.fetch_credits()
             except Exception:
                 pass
-            return {"ok": True, "msg": "每日活跃对话成功完成"}
+            result = {"ok": True, "msg": "每日活跃对话成功完成"}
+            if web is None:
+                web = bool(self.path) and wb_settings.daily_chat_web(os.path.dirname(self.path))
+            if web:
+                res = self.daily_chat_web()
+                result["web"] = res
+                if res.get("ok"):
+                    result["msg"] = ("每日活跃对话成功完成（网页通道 %s：%d 段输出，%d ms）"
+                                     % (res.get("status") or "completed",
+                                        res.get("chunks") or 0, res.get("elapsed_ms") or 0))
+                else:
+                    result["msg"] = ("每日活跃对话成功完成（网页通道失败：%s）"
+                                     % res.get("error"))
+            return result
         except urllib.error.HTTPError as exc:
             try:
                 err = exc.read().decode("utf-8", "replace")
@@ -732,13 +914,6 @@ class AccountPool(object):
                     self.log("account %s unreadable: %s" % (name, exc))
                     continue
                 if account.uid:
-                    # Migration: disabled accounts must not hold an exit slot.
-                    if not account.enabled and account.proxy_slot:
-                        account.proxy_slot = ""
-                        try:
-                            account.save(self.dir)
-                        except Exception:
-                            pass
                     self.accounts.append(account)
             self.apply_reserve_credits()
             return self.accounts
@@ -868,10 +1043,6 @@ class AccountPool(object):
         account.enabled = bool(enabled)
         if enabled:
             account.clear_error()
-        else:
-            # A disabled account must not hold an exit slot: free it so the
-            # slot can be handed to an active account.
-            account.proxy_slot = ""
         account.save(self.dir)
         self.apply_proxy_slots()
         return account.public()
@@ -924,6 +1095,44 @@ class AccountPool(object):
                 account.reserve_credits = value
         return value
 
+    def apply_daily_token_limit(self, value=None, usage=None):
+        """Re-resolve the daily token guard for every account.
+
+        Same shape as apply_reserve_credits(): settings.json holds the limit,
+        while `usage` (uid -> tokens counted today) comes from the caller,
+        because only the proxy reads the usage log. Passing None keeps the
+        last known counts, so a settings change never turns them into
+        "unknown".
+        """
+        import wb_settings
+
+        if value is None:
+            value = wb_settings.daily_token_limit(self.dir)
+        try:
+            value = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            value = 0
+        with self._lock:
+            for account in self.accounts:
+                was_blocked = account.daily_limit_blocked()
+                account.daily_token_limit = value
+                if usage is not None:
+                    try:
+                        account.daily_tokens_today = int(usage.get(account.uid, 0))
+                    except (TypeError, ValueError):
+                        account.daily_tokens_today = None
+                now_blocked = account.daily_limit_blocked()
+                if now_blocked != was_blocked:
+                    if now_blocked:
+                        self.log("account %s parked: daily token limit reached "
+                                 "(%s/%s tokens today)"
+                                 % (str(account.uid)[:8],
+                                    account.daily_tokens_today, value))
+                    else:
+                        self.log("account %s resumed: daily token limit cleared"
+                                 % str(account.uid)[:8])
+        return value
+
     def set_proxy_slot(self, uid, slot_id):
         account = self.get(uid)
         if account is None:
@@ -946,10 +1155,6 @@ class AccountPool(object):
                 account.enabled = bool(enabled)
                 if enabled:
                     account.clear_error()
-                else:
-                    # Same rule as set_enabled: a disabled account must not
-                    # hold an exit slot.
-                    account.proxy_slot = ""
                 account.save(self.dir)
         self.apply_proxy_slots()
 

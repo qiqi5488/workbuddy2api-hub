@@ -297,10 +297,6 @@ a:hover{text-decoration:underline}
   #pageSettings section > div[style*="display:flex"]{flex-wrap:wrap}
   #pageSettings input:not([type=checkbox]), #pageSettings select{min-height:40px;font-size:13px}
   #pageSettings .slot-input{font-size:13px}
-  /* Per-key model picker: the chips are the tap targets, so they follow the
-     same ≥40px rule as every other control in this form. */
-  #pageSettings [id^="editKeyModels_"] label{min-height:40px;padding:8px 12px;font-size:13px}
-  #pageSettings [id^="editKeyModels_"] input[type=checkbox]{width:18px;height:18px}
   table.data-cards td[data-label="启用"]{justify-content:space-between}
   table.data-cards td[data-label="启用"] input[type=checkbox]{width:20px;height:20px}
   /* Logs */
@@ -485,7 +481,8 @@ a:hover{text-decoration:underline}
     <div class="toolbar">
     <button onclick="openLoginModal()">+ 添加账号 (OAuth)</button>
     <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">每日签到 (国内版)</button>
-    <button class="sec" id="btnDailyChat" onclick="doDailyChat(this)" style="display:none">每日活跃打卡 (国际版)</button>
+      <button class="sec" id="btnDailyChat" onclick="doDailyChat(this)" style="display:none">每日活跃打卡 (国际版)</button>
+      <button class="sec" id="btnDailyChatWeb" onclick="doDailyChatWeb(this)" style="display:none">网页通道打卡 (国际版)</button>
     <!-- 入口暂时隐藏：桌面客户端自 2026-09-24 起把 token 改成加密存储（$wbEncrypted
          信封），扫描导入只会得到一串无法使用的信封文本，之后每个请求都 401。等解密
          打通或改走 OAuth 之后再放出来。scanDesktop() 与后端接口都保留未删。 -->
@@ -772,13 +769,95 @@ a:hover{text-decoration:underline}
             <input id="setReserveCredits" type="number" min="0" step="1" value="0"
                    style="width:150px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
           </div>
-          <button onclick="saveReserveCredits(this)">保存</button>
+            <button onclick="saveReserveCredits(this)">保存</button>
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section>
-      <h2>运行信息</h2>
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">每日 Token 限额 <em id="setDailyTokenState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              账号当日消耗的 token 达到该值后暂停接单，请求自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示不限（不限额）；与「保留积分」各自独立，任一命中都会暂停接单。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <div>
+              <div style="font-size:12px;color:var(--dim);margin-bottom:4px">每账号每日上限（token）</div>
+              <input id="setDailyTokenLimit" type="number" min="0" step="1000000" value="0"
+                     style="width:170px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+            </div>
+            <button onclick="saveDailyTokenLimit(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">429 自动切换出站身分 <em id="setAutoSwitchState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              某账号在某模型上被上游限流（429）时，自动在 WB / VSC / CLI 之间换身分重试，每轮最多 4 次。三条身分走不同的配额通道，开启后 429 会少一些。默认关闭。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              注意：切换后的身分会被保存，重启后继续沿用，不会自动回到 WB。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setAutoSwitch" type="checkbox" style="width:16px;height:16px">
+              启用自动切换
+            </label>
+            <button onclick="saveAutoSwitchProduct(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">国际版每日活跃打卡 <em id="setDailyChatWebState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话（在 console/as 下建一个带 prompt 的会话）。实测只有网页端对话会被计入官方「每日活跃」，桌面身分的对话不计入。默认开启。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              注意：网页通道会真的起一次任务，消耗该账号少量积分，换来的是每日 30/50 积分活跃奖励。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setDailyChatWeb" type="checkbox" style="width:16px;height:16px">
+              走网页通道
+            </label>
+            <button onclick="saveDailyChatWeb(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">本地网络工具 (web_search / web_fetch) <em id="setLocalWebToolsState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索走 DuckDuckGo，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              注意：开启后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号的额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setLocalWebTools" type="checkbox" style="width:16px;height:16px">
+              由网关代跑
+            </label>
+            <button onclick="saveLocalWebTools(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>运行信息</h2>
       <table>
         <tbody>
           <tr><td>当前版本</td><td class="mono" id="setVersion">-</td></tr>
@@ -1075,6 +1154,8 @@ function updateUI(){
   if(btnCheckin) btnCheckin.style.display = (window.VIEW_REALM === "cn" ? "inline-block" : "none");
   const btnDailyChat = document.getElementById("btnDailyChat");
   if(btnDailyChat) btnDailyChat.style.display = (window.VIEW_REALM === "intl" ? "inline-block" : "none");
+  const btnDailyChatWeb = document.getElementById("btnDailyChatWeb");
+  if(btnDailyChatWeb) btnDailyChatWeb.style.display = (window.VIEW_REALM === "intl" ? "inline-block" : "none");
 
   // 计算当前绑定与生效的 Key 数量
   const keys = (typeof API_KEY_ROWS !== 'undefined' && API_KEY_ROWS.length) ? API_KEY_ROWS : (window.API_KEY_ROWS || []);
@@ -1488,6 +1569,24 @@ async function doDailyChat(btn){
   finally { btn.disabled = false; btn.textContent = ot; }
 }
 
+/* 网页通道打卡：只建网页端会话（官方每日活跃只认网页端对话）。
+ * 会真的起一次任务、消耗该账号少量积分，所以先确认一次。 */
+async function doDailyChatWeb(btn){
+  if(!confirm('将为每个已启用的国际版账号各建一个网页端会话。\n\n这会真的起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。继续？')) return;
+  btn.disabled = true; const ot = btn.textContent; btn.textContent = "打卡中...";
+  try {
+    const r = await postJSON("/accounts/daily-chat-web", {});
+    const res = r.results || [];
+    if(!res.length) toast("未发现国际版账号", "warn");
+    else {
+      const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? ("已建会话 " + (x.conversation||"")) : (x.error||"失败"))).join("；");
+      toast("网页通道打卡: " + summary, res.some(x => x.ok) ? "ok" : "warn");
+    }
+    await refreshActiveRealm(); window.updateUI(); loadAccounts(); loadModels();
+  }catch(e){ toast("网页通道打卡失败: " + e.message, "bad"); }
+  finally { btn.disabled = false; btn.textContent = ot; }
+}
+
 const fmt = n => (n ?? 0).toLocaleString('en-US');
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ms = v => v == null ? '—' : (v >= 1000 ? (v/1000).toFixed(2) + ' s' : Math.round(v) + ' ms');
@@ -1647,6 +1746,7 @@ function accountRow(a){
   const usage = USAGE_BY_ACCOUNT[a.uid] || {};
   const state = !a.enabled ? '<span class="badge off">已停用</span>'
               : a.reserveBlocked ? '<span class="badge warn">保留积分</span>'
+              : a.dailyLimitBlocked ? '<span class="badge warn" title="今日已用 ' + fmt(a.dailyTokensToday || 0) + ' / ' + fmt(a.dailyTokenLimit || 0) + ' token，暂停接单（本地 0 点恢复）">日限额</span>'
               : a.inCooldown ? '<span class="badge warn">冷却 ' + (a.cooldownFor||0) + 's</span>'
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
@@ -2218,12 +2318,14 @@ async function refreshInner(){
   // An account parked by the low-credit guard is enabled but not serving, so
   // the pool card must not count it as "正常".
   const accts = window.ACCOUNTS || [];
-  const activeAccts = accts.filter(a => a.enabled && !a.reserveBlocked).length;
+  const activeAccts = accts.filter(a => a.enabled && !a.reserveBlocked && !a.dailyLimitBlocked).length;
   const totalAccts = accts.length;
   const parkedAccts = accts.filter(a => a.enabled && a.reserveBlocked).length;
   const disabledAccts = accts.filter(a => !a.enabled).length;
+  const dailyAccts = accts.filter(a => a.enabled && a.dailyLimitBlocked).length;
   const poolNotes = [];
   if(parkedAccts) poolNotes.push(parkedAccts + ' 个保留积分');
+  if(dailyAccts) poolNotes.push(dailyAccts + ' 个达日限额');
   if(disabledAccts) poolNotes.push(disabledAccts + ' 个停用');
   const poolSub = poolNotes.length ? poolNotes.join(' · ') : '全部启用 · 状态健康';
   const pctRemain = totSize > 0 ? ((totRemain / totSize) * 100).toFixed(1) + '%' : '';
@@ -2524,11 +2626,43 @@ async function loadSettings(showToast){
     const reserveValue = Number(data.reserve_credits || 0);
     const reserveInput = document.getElementById('setReserveCredits');
     if(reserveInput) reserveInput.value = String(reserveValue);
-    const reserveState = document.getElementById('setReserveState');
-    if(reserveState){
-      reserveState.textContent = reserveValue > 0 ? ('(低于 ' + reserveValue + ' 暂停接单)') : '(未启用)';
-      reserveState.style.color = reserveValue > 0 ? 'var(--accent2)' : 'var(--dim)';
-    }
+      const reserveState = document.getElementById('setReserveState');
+      if(reserveState){
+        reserveState.textContent = reserveValue > 0 ? ('(低于 ' + reserveValue + ' 暂停接单)') : '(未启用)';
+        reserveState.style.color = reserveValue > 0 ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const dailyTokValue = Number(data.daily_token_limit || 0);
+      const dailyTokInput = document.getElementById('setDailyTokenLimit');
+      if(dailyTokInput) dailyTokInput.value = String(dailyTokValue);
+      const dailyTokState = document.getElementById('setDailyTokenState');
+      if(dailyTokState){
+        dailyTokState.textContent = dailyTokValue > 0 ? ('(每账号每天 ' + fmt(dailyTokValue) + ' token)') : '(不限)';
+        dailyTokState.style.color = dailyTokValue > 0 ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const autoSwitch = data.auto_switch_product === true;
+      const autoSwitchInput = document.getElementById('setAutoSwitch');
+      if(autoSwitchInput) autoSwitchInput.checked = autoSwitch;
+      const autoSwitchState = document.getElementById('setAutoSwitchState');
+      if(autoSwitchState){
+        autoSwitchState.textContent = autoSwitch ? '(已启用)' : '(未启用)';
+        autoSwitchState.style.color = autoSwitch ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const dailyWeb = data.daily_chat_web !== false;
+      const dailyWebInput = document.getElementById('setDailyChatWeb');
+      if(dailyWebInput) dailyWebInput.checked = dailyWeb;
+      const dailyWebState = document.getElementById('setDailyChatWebState');
+      if(dailyWebState){
+        dailyWebState.textContent = dailyWeb ? '(已启用)' : '(仅桌面端对话)';
+        dailyWebState.style.color = dailyWeb ? 'var(--accent2)' : 'var(--dim)';
+      }
+      const localWeb = data.local_web_tools === true;
+      const localWebInput = document.getElementById('setLocalWebTools');
+      if(localWebInput) localWebInput.checked = localWeb;
+      const localWebState = document.getElementById('setLocalWebToolsState');
+      if(localWebState){
+        localWebState.textContent = localWeb ? '(已启用)' : '(直通)';
+        localWebState.style.color = localWeb ? 'var(--accent2)' : 'var(--dim)';
+      }
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
@@ -2540,8 +2674,7 @@ async function loadSettings(showToast){
       stored_key: '',
       masked: k.masked || '',
       realm: k.realm || '',
-      // Empty means "every model"; the picker treats it as unrestricted.
-      models: (k.models || []).slice(),
+      models: Array.isArray(k.models) ? k.models.slice() : [],
       // 0 means "never expires".
       expires_at: k.expires_at || 0,
       expired: k.expired === true,
@@ -2605,6 +2738,67 @@ async function saveReserveCredits(btn){
   }
 }
 
+async function saveDailyTokenLimit(btn){
+  const el = document.getElementById('setDailyTokenLimit');
+  const value = Math.floor(Number((el || {}).value || 0));
+  if(!Number.isFinite(value) || value < 0){ toast('请填写 0 或正整数（token）', 'warn'); return; }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {daily_token_limit: value});
+    toast(value > 0 ? ('已启用：账号当日超过 ' + fmt(value) + ' token 后暂停接单') : '已设为不限（0 = 不限额）', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveAutoSwitchProduct(btn){
+  const el = document.getElementById('setAutoSwitch');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {auto_switch_product: value});
+    toast(value ? '已启用：429 时自动切换出站身分' : '已关闭自动切换出站身分', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveDailyChatWeb(btn){
+  const el = document.getElementById('setDailyChatWeb');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {daily_chat_web: value});
+    toast(value ? '已启用：国际版打卡走网页通道' : '已关闭：国际版打卡只发桌面端对话', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveLocalWebTools(btn){
+  const el = document.getElementById('setLocalWebTools');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {local_web_tools: value});
+    toast(value ? '已启用：由网关代跑 web_search / web_fetch' : '已关闭：工具声明原样透传', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
 /* ---- API key list: several keys, each bound to an upstream exit ---- */
 let API_KEY_ROWS = [];
 
@@ -2622,64 +2816,6 @@ const REALM_CHOICES = [
   ['intl', '固定国际版出口'],
   ['cn', '固定国内版出口'],
 ];
-
-/* ---- per-key model allowlist ----
-   A key with an empty list may use every model, which is how every key
-   written before this field existed behaves. The list offered is the one for
-   the exit the panel is currently showing, so switching the exit re-scopes
-   what can be ticked; models already stored on the key are always kept. */
-function modelChoicesHtml(index, row){
-  const list = (MODELS_DATA || []).map(m => m.id).filter(Boolean);
-  const selected = new Set((row.models || []).map(m => String(m).toLowerCase()));
-  // Models stored on this key that the exit on screen does not list (the key
-  // is bound to the other exit, or the catalog changed) are still rendered.
-  // Leaving them out would drop them from the row on the next save, silently
-  // widening a restricted key.
-  const extra = (row.models || []).filter(m => !list.some(id => String(id).toLowerCase() === String(m).toLowerCase()));
-  if(!list.length && !extra.length){
-    return '<div style="font-size:12px;color:var(--dim);padding:6px 0">'
-      + '模型列表尚未加载，稍后重试；留空表示不限制。</div>';
-  }
-  const chip = (mid, outOfView) => {
-    const on = selected.has(String(mid).toLowerCase());
-    return '<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;'
-      + 'background:var(--panel2);border:1px solid ' + (on ? 'var(--accent)' : 'var(--line)') + ';'
-      + 'border-radius:999px;padding:4px 10px;cursor:pointer">'
-      + '<input type="checkbox" data-model="' + esc(mid) + '"' + (on ? ' checked' : '')
-      + ' onchange="onKeyModelToggle(this)">' + esc(mid)
-      + (outOfView ? '<span style="color:var(--dim-light)">(另一出口)</span>' : '') + '</label>';
-  };
-  return '<div id="editKeyModels_' + index + '" style="display:flex;flex-wrap:wrap;gap:6px">'
-    + list.map(mid => chip(mid, false)).join('')
-    + extra.map(mid => chip(mid, true)).join('')
-    + '</div>';
-}
-
-function onKeyModelToggle(el){
-  const label = el && el.closest ? el.closest('label') : null;
-  if(label) label.style.borderColor = el.checked ? 'var(--accent)' : 'var(--line)';
-}
-
-function toggleAllKeyModels(index, on){
-  const box = document.getElementById('editKeyModels_' + index);
-  if(!box) return;
-  box.querySelectorAll('input[type=checkbox]').forEach(cb => {
-    cb.checked = on;
-    const label = cb.closest ? cb.closest('label') : null;
-    if(label) label.style.borderColor = on ? 'var(--accent)' : 'var(--line)';
-  });
-}
-
-function readKeyModels(index){
-  const box = document.getElementById('editKeyModels_' + index);
-  if(!box) return (API_KEY_ROWS[index] || {}).models || [];
-  const out = [];
-  box.querySelectorAll('input[type=checkbox]').forEach(cb => {
-    const mid = cb.getAttribute('data-model');
-    if(cb.checked && mid) out.push(mid);
-  });
-  return out;
-}
 
 /* ---- per-key expiry ----
    Stored as a unix timestamp so the gateway can compare it against its own
@@ -2796,6 +2932,21 @@ async function resetKeyTokenUsage(index){
   }
 }
 
+/* Model allow-list per key. Patterns are matched case-insensitively with `*`
+   wildcards ("deepseek*", "gpt-6-astra"). An empty list means no limit, which
+   is how every key saved before this field existed comes back. */
+function parseModelPatterns(text){
+  const out = [];
+  String(text || '').split(/[,;]/).forEach(part => {
+    const pattern = part.trim().toLowerCase();
+    if(pattern && out.indexOf(pattern) === -1) out.push(pattern);
+  });
+  return out;
+}
+function modelPatternsText(patterns){
+  return Array.isArray(patterns) ? patterns.join(', ') : '';
+}
+
 function renderKeyRows(){
   const box = document.getElementById('keyList');
   if(!box) return;
@@ -2826,14 +2977,9 @@ function renderKeyRows(){
         +     '</select>'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
-        +     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
-        +       '<div style="font-size:12px;color:var(--dim);font-weight:500">可用模型 <span style="color:var(--dim-light)">(不勾选 = 不限制；当前出口的模型)</span></div>'
-        +       '<div style="display:flex;gap:6px">'
-        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="toggleAllKeyModels(' + i + ', true)">全选</button>'
-        +         '<button class="sec mini" style="border-radius:8px;padding:3px 10px" onclick="toggleAllKeyModels(' + i + ', false)">清空</button>'
-        +       '</div>'
-        +     '</div>'
-        +     modelChoicesHtml(i, row)
+        +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">模型限制 <span style="color:var(--dim-light)">(选填，留空 = 不限制)</span></div>'
+          +     '<input type="text" id="editKeyModels_' + i + '" value="' + esc(modelPatternsText(row.models)) + '" placeholder="如 deepseek* 或 gpt-6-astra；多个用逗号分隔，支持 * 通配" '
+        +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
         +     '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
@@ -2880,10 +3026,9 @@ function renderKeyRows(){
       ? '<span class="realm-badge-cn" style="font-size:11px">固定国内版出口</span>'
       : '<span class="badge s" style="font-size:11px">跟随面板切换</span>';
 
-    const modelCount = (row.models || []).length;
-    const modelBadge = modelCount
-      ? '<span class="badge s" style="font-size:11px" title="' + esc((row.models || []).join(', ')) + '">限 ' + modelCount + ' 个模型</span>'
-      : '<span class="badge" style="font-size:11px">全部模型</span>';
+    const modelBadge = (Array.isArray(row.models) && row.models.length)
+      ? '<span class="badge s" style="font-size:11px">限 ' + esc(modelPatternsText(row.models)) + '</span>'
+      : '';
 
     const expBadge = expiryBadge(row);
     const tokBadge = tokenBadge(row);
@@ -2948,11 +3093,11 @@ async function saveSingleKey(index, btn){
   const nameInput = document.getElementById('editKeyName_' + index);
   const realmSelect = document.getElementById('editKeyRealm_' + index);
   const keyInput = document.getElementById('editKeyValue_' + index);
+  const modelsInput = document.getElementById('editKeyModels_' + index);
 
   const name = nameInput ? nameInput.value.trim() : (row.name || '');
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
-  const models = readKeyModels(index);
   const expiresAt = readKeyExpiry(index);
   const tokenLimit = readKeyTokenLimit(index);
 
@@ -2963,7 +3108,7 @@ async function saveSingleKey(index, btn){
 
   row.name = name || '未命名';
   row.realm = realm;
-  row.models = models;
+  row.models = parseModelPatterns(modelsInput ? modelsInput.value : modelPatternsText(row.models));
   row.expires_at = expiresAt;
   row.expired = expiresAt > 0 && expiresAt * 1000 <= Date.now();
   row.token_limit = tokenLimit;
@@ -3103,6 +3248,13 @@ async function saveApiKeys(btn){
 }
 
 let PROXY_SLOTS = [];
+/* 编辑器里有未保存改动时为 true（issue #79）。
+ *
+ * 刷新槽位是「拉服务端列表 → 整体替换 → 重绘整张表」，而「+ 添加槽位」只是把
+ * 一行 push 进本地列表、服务端并不知道它存在；loadAccounts() 每 15 秒会顺带
+ * 刷新一次槽位，于是刚加的那行（以及改了一半的已有行）会被服务端的旧列表顶掉。
+ * 置位期间跳过刷新，保存成功后清零。 */
+let SLOTS_DIRTY = false;
 let SLOT_DISCOVER = [];
 
 function slotSelectHtml(a){
@@ -3141,7 +3293,9 @@ async function setAccountSlot(uid, slotId, el){
   }
 }
 
-async function loadProxySlots(){
+async function loadProxySlots(force){
+  // 编辑器有未保存改动时不动它：轮询与「切到设置页」都不该覆盖正在填的内容。
+  if(SLOTS_DIRTY && !force) return;
   try{
     const r = await getJSON('/proxy/slots');
     PROXY_SLOTS = r.slots || [];
@@ -3151,11 +3305,28 @@ async function loadProxySlots(){
   }
 }
 
+/* 标题旁的状态提示。单独抽出来，是因为标记「未保存」时只能更新这段文字，
+ * 不能重绘表格——重绘会让正在输入的那个框失焦。 */
+function renderSlotState(){
+  const stateEl = document.getElementById('slotState');
+  if(!stateEl) return;
+  const parts = [];
+  if(PROXY_SLOTS.length) parts.push(PROXY_SLOTS.length + ' 个');
+  if(SLOTS_DIRTY) parts.push('未保存');
+  stateEl.textContent = parts.length ? ('（' + parts.join(' · ') + '）') : '';
+  stateEl.style.color = SLOTS_DIRTY ? 'var(--warn)' : '';
+}
+
+function markSlotsDirty(){
+  if(SLOTS_DIRTY) return;
+  SLOTS_DIRTY = true;
+  renderSlotState();
+}
+
 function renderProxySlots(){
   const box = document.getElementById('slotList');
   if(!box) return;
-  const stateEl = document.getElementById('slotState');
-  if(stateEl) stateEl.textContent = PROXY_SLOTS.length ? ('（' + PROXY_SLOTS.length + ' 个）') : '';
+  renderSlotState();
   if(!PROXY_SLOTS.length){
     box.innerHTML = '<div class="hint" style="color:var(--dim)">还没有代理槽。点击「自动发现 mihomo 端口」或「+ 添加槽位」。</div>';
     return;
@@ -3169,10 +3340,10 @@ function renderProxySlots(){
     + '</tr></thead><tbody>'
     + PROXY_SLOTS.map((s, i) =>
         '<tr>'
-        + '<td data-label="名称"><input value="' + esc(s.name || '') + '" oninput="PROXY_SLOTS[' + i + '].name=this.value" class="slot-input"></td>'
-        + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" oninput="PROXY_SLOTS[' + i + '].url=this.value" class="slot-input mono"></td>'
+        + '<td data-label="名称"><input value="' + esc(s.name || '') + '" oninput="PROXY_SLOTS[' + i + '].name=this.value; markSlotsDirty()" class="slot-input"></td>'
+        + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" oninput="PROXY_SLOTS[' + i + '].url=this.value; markSlotsDirty()" class="slot-input mono"></td>'
         + '<td style="text-align:center" data-label="启用"><input type="checkbox" ' + (s.enabled === false ? '' : 'checked')
-        +   ' onchange="PROXY_SLOTS[' + i + '].enabled=this.checked"></td>'
+        +   ' onchange="PROXY_SLOTS[' + i + '].enabled=this.checked; markSlotsDirty()"></td>'
         + '<td style="text-align:center" data-label="绑定账号">' + (s.bound || 0) + '</td>'
         + '<td style="text-align:center;white-space:nowrap" data-label="">'
         +   '<button class="sec mini" onclick="testProxySlot(' + i + ', this)">测试</button> '
@@ -3184,6 +3355,7 @@ function renderProxySlots(){
 }
 
 function addProxySlotRow(){
+  SLOTS_DIRTY = true;
   PROXY_SLOTS.push({id: '', name: '槽 ' + (PROXY_SLOTS.length + 1), url: '', enabled: true, bound: 0});
   renderProxySlots();
 }
@@ -3192,6 +3364,7 @@ function removeProxySlot(index){
   const s = PROXY_SLOTS[index];
   if(!s) return;
   if((s.bound || 0) > 0 && !confirm('该槽位被 ' + s.bound + ' 个账号绑定，删除后它们将回退直连。继续？')) return;
+  SLOTS_DIRTY = true;
   PROXY_SLOTS.splice(index, 1);
   renderProxySlots();
 }
@@ -3200,11 +3373,12 @@ async function saveProxySlots(btn){
   if(btn) btn.disabled = true;
   try{
     const payload = PROXY_SLOTS.map(s => ({id: s.id || '', name: s.name || '', url: (s.url || '').trim(), enabled: s.enabled !== false}));
-    const r = await postJSON('/proxy/slots/save', {slots: payload});
-    PROXY_SLOTS = r.slots || [];
-    renderProxySlots();
-    await loadAccounts();
-    toast('已保存 ' + PROXY_SLOTS.length + ' 个代理槽', 'ok');
+      const r = await postJSON('/proxy/slots/save', {slots: payload});
+      PROXY_SLOTS = r.slots || [];
+      SLOTS_DIRTY = false;
+      renderProxySlots();
+      await loadAccounts();
+      toast('已保存 ' + PROXY_SLOTS.length + ' 个代理槽', 'ok');
   }catch(e){
     toast('保存失败: ' + e.message, 'bad');
   }finally{
@@ -3222,6 +3396,7 @@ async function testProxySlot(index, btn){
       const payload = PROXY_SLOTS.map(x => ({id: x.id || '', name: x.name || '', url: (x.url || '').trim(), enabled: x.enabled !== false}));
       const r = await postJSON('/proxy/slots/save', {slots: payload});
       PROXY_SLOTS = r.slots || [];
+      SLOTS_DIRTY = false;
       renderProxySlots();
       id = (PROXY_SLOTS[index] || {}).id;
     }
@@ -3943,7 +4118,7 @@ function renderPerfMatrix(usage, perf){
         // say). Decide from the model id itself: this table
         // spans both realms, so the gateway's current exit
         // would mislabel domestic-only models.
-        const isIntlOnly = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gemini-3.5-flash'].includes(m.id);
+        const isIntlOnly = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gemini-3.5-flash', 'grok-4.7'].includes(m.id);
         const isCnOnly = ['deepseek-v4-pro', 'glm-5.1', 'glm-5v-turbo', 'kimi-k3-1', 'kimi-k2.7', 'minimax-m3'].includes(m.id);
         realmCell = isIntlOnly ? '<span class="realm-badge-intl">国际版</span>'
           : (isCnOnly ? '<span class="realm-badge-cn">国内版</span>'

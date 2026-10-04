@@ -7,6 +7,7 @@ password is never stored in clear text - only a PBKDF2-SHA256 digest.
 Only the Python standard library is required.
 """
 
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -147,24 +148,6 @@ def ensure_launcher_key(accounts_dir):
 REALMS = ("", "intl", "cn")
 
 
-def _clean_key_models(value):
-    """Normalize one key's model allowlist; an empty list means "every model".
-
-    Stored lowercased because model ids are matched case-insensitively, so a
-    panel that saves `GLM-5.3` still restricts exactly the model upstream
-    answers to as `glm-5.3`.
-    """
-    if not isinstance(value, (list, tuple, set)):
-        return []
-    out, seen = [], set()
-    for raw in value:
-        mid = str(raw or "").strip().lower()
-        if mid and mid not in seen:
-            seen.add(mid)
-            out.append(mid)
-    return out
-
-
 def _clean_key_expiry(value):
     """Normalize one key's expiry to epoch seconds.
 
@@ -230,6 +213,45 @@ def _clean_key_token_limit(value):
     return limit if limit > 0 else 0
 
 
+def _clean_model_patterns(value):
+    """Normalize one key's model allow-list into a list of lowercase patterns.
+
+    The panel posts a list; a hand-edited settings.json tends to hold a
+    comma-separated string, so both shapes are accepted. Matching is done with
+    fnmatch, which makes an exact name (`gpt-6-astra`) and a wildcard
+    (`deepseek/*`) behave the same way. An empty result means "no restriction",
+    which is what every key written before this field existed reads back as -
+    an upgrade therefore keeps behaving exactly as before.
+    """
+    if isinstance(value, str):
+        raw = [part for part in re.split(r"[,;\n]", value)]
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        pattern = str(item or "").strip().lower()
+        if pattern and pattern not in out:
+            out.append(pattern)
+    return out
+
+
+def key_allows_model(entry, model):
+    """True when `entry` places no model restriction, or `model` matches it.
+
+    A key with an empty list stays unrestricted, so nothing changes for
+    installs that never touch this field.
+    """
+    patterns = _clean_model_patterns((entry or {}).get("models"))
+    if not patterns:
+        return True
+    name = str(model or "").strip().lower()
+    if not name:
+        return True
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -245,24 +267,12 @@ def _clean_key_entry(entry):
         "name": str(entry.get("name") or "").strip() or "未命名",
         "key": key,
         "realm": realm,
-        "models": _clean_key_models(entry.get("models")),
+        "models": _clean_model_patterns(entry.get("models")),
         "expires_at": _clean_key_expiry(entry.get("expires_at")),
         "token_limit": _clean_key_token_limit(entry.get("token_limit")),
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
     }
-
-
-def key_allows_model(entry, model):
-    """True when `entry` may call `model`.
-
-    An empty allowlist is unrestricted, which is what every key written before
-    the field existed reads back as - so an upgrade cannot lock anyone out.
-    """
-    allowed = (entry or {}).get("models") or []
-    if not allowed:
-        return True
-    return str(model or "").strip().lower() in allowed
 
 
 def _unique_key_id(candidate, used):
@@ -428,6 +438,101 @@ def set_reserve_credits(accounts_dir, value):
         data["reserve_credits"] = value
         save(accounts_dir, data)
     return value
+
+
+def daily_token_limit(accounts_dir):
+    """Global daily guard: an account that already burned this many tokens
+    today stays idle until local midnight.
+
+    Zero disables the guard, which keeps installs that predate the setting
+    behaving exactly as before.
+    """
+    try:
+        value = int(load(accounts_dir).get("daily_token_limit") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def set_daily_token_limit(accounts_dir, value):
+    """Persist the daily token threshold. Returns the stored value."""
+    try:
+        value = int(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    value = max(0, value)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_token_limit"] = value
+        save(accounts_dir, data)
+    return value
+
+
+def auto_switch_product(accounts_dir):
+    """Whether an upstream 429 may rotate an account's outbound identity.
+
+    Off unless the operator turns it on. Rotating identity spends the request's
+    retry budget and leaves the account on a channel nobody picked, so the
+    gateway does not decide that on its own - and an install that predates the
+    setting keeps behaving exactly as it did.
+    """
+    return load(accounts_dir).get("auto_switch_product") is True
+
+
+def set_auto_switch_product(accounts_dir, enabled):
+    """Persist the auto-switch toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["auto_switch_product"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web(accounts_dir):
+    """Whether the intl daily check-in also opens a web-channel conversation.
+
+    On unless the operator turns it off: the desktop-identity chat completion
+    this automation used to send does not register the daily activity, while a
+    web conversation does (issues #75, #59). An install that never touched the
+    setting keeps the web step, because that is the behaviour that earns the
+    credits; the toggle exists so a deployment can opt back into the old
+    single-request check-in.
+    """
+    value = load(accounts_dir).get("daily_chat_web")
+    return True if value is None else value is True
+
+
+def set_daily_chat_web(accounts_dir, enabled):
+    """Persist the web-channel toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web"] = enabled
+        save(accounts_dir, data)
+    return enabled
+def local_web_tools(accounts_dir):
+    """Whether the gateway runs web_search / web_fetch calls itself.
+
+    Off unless the operator turns it on. Forwarding the client's declaration
+    untouched is what this gateway has done since v1.5.3, and it is what an
+    install that never touched the switch keeps doing: the upstream has no
+    server-side search tool, so a client declaring one runs it in its own
+    process. Turning the switch on swaps the declaration for the gateway's own
+    function and executes the calls locally (wb_webtools), which also means the
+    gateway itself fetches the URLs a model asks for - hence opt-in only.
+    """
+    return load(accounts_dir).get("local_web_tools") is True
+
+
+def set_local_web_tools(accounts_dir, enabled):
+    """Persist the local web-tools switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["local_web_tools"] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")

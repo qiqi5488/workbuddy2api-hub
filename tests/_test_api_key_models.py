@@ -280,9 +280,15 @@ try:
     status, err = request(port, "/settings/save", method="POST", panel_token=token,
                           body={"api_keys": [
                               {"id": "k1", "name": "restricted", "key": "",
-                               "models": "glm-5.3"},
+                               "models": "glm-5.3, kimi-k3"},
                           ]})
-    check("a non-list models value is rejected", status == 400, (status, err))
+    # A hand-edited settings.json tends to hold a comma-separated string rather
+    # than a list, so the gateway accepts that shape and normalizes it.
+    check("a comma-separated string is accepted", status == 200, (status, err))
+    status, view = request(port, "/settings", panel_token=token)
+    by_id = {k.get("id"): k for k in view.get("api_keys") or []}
+    check("and is split into patterns",
+          by_id.get("k1", {}).get("models") == ["glm-5.3", "kimi-k3"], by_id.get("k1"))
 finally:
     proc.terminate()
     try:
