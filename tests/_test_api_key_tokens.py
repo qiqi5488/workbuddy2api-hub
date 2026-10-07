@@ -130,27 +130,27 @@ P.load_key_tokens()
 fake = {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
         "completion_tokens_details": {"reasoning_tokens": 0},
         "prompt_tokens_details": {"cached_tokens": 0}}
-P.record_usage("glm-5.3", fake, key_id="k1")
+P.record_usage("glm-5.3", fake, key="k1")
 check("the completed request is attributed", P.key_token_usage("k1") == 150,
       P.key_token_usage("k1"))
 
 with open(P.USAGE_LOG, encoding="utf-8") as fh:
     rows = [json.loads(line) for line in fh if line.strip()]
-check("the key id is written to the usage row", rows and rows[-1].get("key_id") == "k1",
+check("the key is written to the usage row", rows and rows[-1].get("key") == "k1",
       rows[-1] if rows else None)
 
 # A request with no usage block must not move the counter.
-P.record_usage("glm-5.3", None, key_id="k1")
+P.record_usage("glm-5.3", None, key="k1")
 check("a request without usage does not inflate the counter",
       P.key_token_usage("k1") == 150, P.key_token_usage("k1"))
 
 # A request with no key id must not be attributed (and must not crash).
-P.record_usage("glm-5.3", fake, key_id=None)
+P.record_usage("glm-5.3", fake, key=None)
 check("a keyless request leaves the counter alone", P.key_token_usage("k1") == 150)
 
 # A failed request that carried partial usage still spent tokens.
 P.record_error("glm-5.3", 502, "stream aborted", usage={"total_tokens": 40},
-               key_id="k1")
+               key="k1")
 check("a failed request's partial usage is still counted",
       P.key_token_usage("k1") == 190, P.key_token_usage("k1"))
 shutil.rmtree(work2, ignore_errors=True)
