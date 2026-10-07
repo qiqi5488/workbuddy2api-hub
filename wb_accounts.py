@@ -154,6 +154,7 @@ RESOURCE_SUMMARY_PATH = "/billing/meter/get-user-resource-summary"
 RESOURCE_FREE_PACKAGES_PATH = "/billing/meter/get-user-resource-free-packages"
 RESOURCE_PAID_PACKAGES_PATH = "/billing/meter/get-user-resource-paid-packages"
 CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
+ENTERPRISE_USAGE_PATH = "/billing/meter/get-enterprise-user-usage"
 
 LOGIN_PENDING = 11217
 LOGIN_TTL_SECONDS = 600
@@ -247,10 +248,54 @@ def desktop_effective_realm(hint, token, domain=None):
         return evidence
     return hint if hint in ("intl", "cn") else "intl"
 
+_DEVICE_TOKEN_CACHE = {"key": None, "token": "", "at": 0.0}
+_DEVICE_TOKEN_LOCK = threading.Lock()
+_DEVICE_TOKEN_TTL = 300
+_DEVICE_TOKEN_MAX_BYTES = 1024
+
+
+def resolve_device_token(accounts_dir):
+    """X-Device-Token fallback: a literal value, or a desktop token file.
+
+    Mirrors the panel's device_token.go: the desktop client writes its
+    token to a file, the gateway reads it (max 1KB, trimmed) and caches
+    the result for five minutes so the header hot path stays cheap.
+    Failures degrade to an empty token instead of breaking a request.
+    """
+    try:
+        cfg = wb_settings.upstream_config(accounts_dir)
+    except Exception:
+        return ""
+    literal = str(cfg.get("device_token") or "").strip()
+    path = str(cfg.get("device_token_file") or "").strip()
+    key = literal or path
+    if not key:
+        return ""
+    now = time.time()
+    with _DEVICE_TOKEN_LOCK:
+        if (_DEVICE_TOKEN_CACHE["key"] == key
+                and now - _DEVICE_TOKEN_CACHE["at"] < _DEVICE_TOKEN_TTL):
+            return _DEVICE_TOKEN_CACHE["token"]
+    token = literal
+    if not token and path:
+        try:
+            if os.path.getsize(path) <= _DEVICE_TOKEN_MAX_BYTES:
+                with open(path, encoding="utf-8") as fh:
+                    token = fh.read().strip()
+        except Exception:
+            token = ""
+    with _DEVICE_TOKEN_LOCK:
+        _DEVICE_TOKEN_CACHE.update({"key": key, "token": token, "at": now})
+    return token
+
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
         self.path = path
+        # Directory of the credential file, so header-time helpers (the
+        # optional X-Device-Token) can resolve settings without a pool lookup.
+        self.accounts_dir = os.path.dirname(path) if path else ""
         token = str(data.get("accessToken") or "")
         self.uid = str(data.get("uid") or jwt_uid(token))
         # The CN desktop build stores its nickname as an encrypted envelope
@@ -277,6 +322,11 @@ class Account(object):
         self.access_token = token
         self.refresh_token = str(data.get("refreshToken") or "")
         self.expires_at = normalize_epoch(data.get("expiresAt")) or jwt_exp(token)
+        # 企业账号登录时切到企业空间（token_source=enterprise_switch），企业 id
+        # 只写在 token 里，凭据文件的 enterpriseId 往往是空的。不回填的话每个
+        # 请求都会带上 X-No-Enterprise-Id: 1，企业目录/配额分支走错。
+        if not self.enterprise_id:
+            self.enterprise_id = self.jwt_enterprise_id(token)
         self.added_at = data.get("addedAt") or time.time()
         self.source = str(data.get("source") or "oauth")
         self.proxy_slot = str(data.get("proxySlot") or "").strip()
@@ -284,12 +334,19 @@ class Account(object):
         # Runtime-resolved value; recomputed by AccountPool.apply_proxy_slots().
         self.proxy = self.proxy_legacy
         self.enabled = data.get("enabled", True)
-        self.last_error = str(data.get("lastError") or "")
+        # Live error state, never restored from the credential file: the label
+        # describes the last upstream answer, not the credential. It used to be
+        # persisted and read back, so a 429 that had long since recovered came
+        # back on the panel after every restart - a successful request only
+        # clears it in memory, and the file is rewritten on unrelated events, so
+        # a stale value could sit on disk for days. Runtime-only, like
+        # model_cooldowns below; see RUNTIME_ONLY_FIELDS and VOLATILE_FIELDS.
+        self.last_error = ""
         # Full upstream body behind `last_error`, for the dashboard tooltip. Kept
         # in its own runtime-only field so the visible label keeps the truncation
         # it has always had; never persisted, never exported.
         self.last_error_detail = ""
-        self.cooldown_until = float(data.get("cooldownUntil") or 0)
+        self.cooldown_until = 0.0
         # Per-model throttling. Upstream rate limits (code 6004 "usage exceeds
         # frequency limit") apply to ONE model for one account, not to the whole
         # account: other models keep working. Cooldown the offending model only,
@@ -344,6 +401,12 @@ class Account(object):
         self._throttle_lock = threading.Lock()
 
     def to_dict(self):
+        """Full view of the account, including live state.
+
+        This is what an export is built from, so it carries the live error and
+        cooldown for inspection. The local credential file must not: save()
+        strips RUNTIME_ONLY_FIELDS before writing.
+        """
         return {
             "uid": self.uid,
             "nickname": self.nickname,
@@ -449,8 +512,14 @@ class Account(object):
         with self._save_lock:
             tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
             try:
+                payload = self.to_dict()
+                # Live error/cooldown state stays out of the credential file;
+                # writing it is what made a long-recovered 429 label reappear on
+                # every restart (see RUNTIME_ONLY_FIELDS).
+                for field in RUNTIME_ONLY_FIELDS:
+                    payload.pop(field, None)
                 with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2)
+                    json.dump(payload, fh, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
             except Exception:
                 try:
@@ -649,6 +718,9 @@ class Account(object):
                 headers["X-No-Enterprise-Id"] = "1"
             if self.realm == "cn":
                 headers["X-Product"] = "SaaS"
+            device_token = self._device_token()
+            if device_token:
+                headers["X-Device-Token"] = device_token
             return headers
 
         identity = wb_identity.build_identity_headers(
@@ -672,7 +744,17 @@ class Account(object):
             "X-Session-ID": derive_id(self.uid, "session"),
         }
         headers.update(identity)
+        device_token = self._device_token()
+        if device_token:
+            headers["X-Device-Token"] = device_token
         return headers
+
+    def _device_token(self):
+        """Optional X-Device-Token from the configured literal or file."""
+        directory = getattr(self, "accounts_dir", "")
+        if not directory:
+            return ""
+        return resolve_device_token(directory)
 
     def set_product(self, value):
         """切換出站身分（cli <-> workbuddy）。回傳 True 表示真的換了。
@@ -1208,14 +1290,131 @@ class Account(object):
             self.save(os.path.dirname(self.path))
         return {"ok": True, "credits": self.credits}
 
+    def jwt_enterprise_id(self, token=None):
+        """企业空间 id，取自 token 自身（或已存的 accessToken）。
+
+        企业账号是登录时切到企业空间换来的 token（token_source=enterprise_switch），
+        账号文件里的 enterpriseId 常常是空的——只有 token 里有。拿不到就返回 ""。
+        """
+        return str(_jwt_claims(token or self.access_token).get("enterprise_id") or "")
+
+    def is_enterprise(self):
+        """True when this account belongs to an enterprise (team) space.
+
+        Enterprise members have no personal resource packages, so the personal
+        billing endpoint always answers TotalCount=0 and the panel shows 0/0.
+        Their credit lives on /billing/meter/get-enterprise-user-usage instead.
+        """
+        return bool(self.enterprise_id or self.jwt_enterprise_id())
+
+    def _fetch_credits_enterprise(self):
+        """企业账号积分：周期内已用 + 周期额度，剩余 = 额度 - 已用。
+
+        上游只回 4 个字段：credit（本周期已消耗，实测随时间单调递增）、
+        limitNum（周期额度）、cycleStartTime / cycleEndTime。没有包列表，
+        所以合成一个包条目，让看板的明细弹窗与到期提示照常工作。
+        """
+        cfg = get_realm_config(self.realm)
+        url = cfg["billing_upstream"] + ENTERPRISE_USAGE_PATH
+        headers = self.headers(purpose="billing")
+        headers["X-Client-Platform"] = "web"
+        try:
+            res = http_json(url, data=b"{}", method="POST", headers=headers,
+                            timeout=15, proxy=self.proxy)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        data = res.get("data") or {}
+        try:
+            used = round(float(data.get("credit") or 0), 2)
+        except (TypeError, ValueError):
+            used = 0.0
+        try:
+            size = round(float(data.get("limitNum") or 0), 2)
+        except (TypeError, ValueError):
+            size = 0.0
+        # 上游只给额度与已用；已用超过额度（或额度缺失）时不要算出负余额。
+        remain = round(max(0.0, size - used), 2) if size > 0 else 0.0
+
+        cycle_start = str(data.get("cycleStartTime") or "")
+        cycle_end = str(data.get("cycleEndTime") or data.get("cycleResetTime") or "")
+        days_left = None
+        is_expired = False
+        if cycle_end:
+            try:
+                clean = cycle_end.replace("T", " ")[:19]
+                end_ts = time.mktime(time.strptime(clean, "%Y-%m-%d %H:%M:%S"))
+                days_left = round((end_ts - time.time()) / 86400.0, 1)
+                is_expired = (end_ts - time.time()) < 0
+            except Exception:
+                pass
+
+        package = {
+            "name": "企业额度" if size else "企业周期额度",
+            "package_code": "enterprise",
+            "product_name": "",
+            "sub_product_name": "",
+            "grant_reason": "企业空间发放",
+            "resource_id": "",
+            "deal_name": "",
+            "create_time": cycle_start,
+            "remain": remain,
+            "used": used,
+            "size": size,
+            "unit": "credits",
+            "in_usage": bool(used > 0),
+            "auto_renew": True,
+            "cycle_start_time": cycle_start,
+            "cycle_end_time": cycle_end,
+            "days_left": days_left,
+            "is_expired": is_expired,
+            "status": 0,
+        }
+        self.credits = {
+            "remain": remain,
+            "used": used,
+            "size": size,
+            "used_percent": ("%.1f%%" % (used / size * 100)) if size > 0 else "0.0%",
+            "remain_percent": ("%.1f%%" % (remain / size * 100)) if size > 0 else "100.0%",
+            "is_paid_user": True,
+            "is_enterprise": True,
+            "checkin": None,
+            "earliest_expiring": ({
+                "name": package["name"],
+                "package_code": "enterprise",
+                "remain": remain,
+                "cycle_end_time": cycle_end,
+                "days_left": days_left,
+            } if cycle_end else None),
+            "packages": [package] if size > 0 else [],
+            "updated_at": time.time(),
+            "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return {"ok": True, "credits": self.credits}
+
     def fetch_credits(self):
         if self.realm == "cn":
             try:
                 res = self._fetch_credits_cn_detailed()
+                # 企业账号在个人计费接口上没有资源包：返回 ok 但全是 0。
+                # 这时改问企业用量接口，否则看板永远是 0/0。
+                if res.get("ok") and not (self.credits or {}).get("size"):
+                    if self.is_enterprise():
+                        ent = self._fetch_credits_enterprise()
+                        if ent.get("ok"):
+                            return ent
                 if res.get("ok"):
                     return res
             except Exception:
                 pass
+            if self.is_enterprise():
+                try:
+                    ent = self._fetch_credits_enterprise()
+                    if ent.get("ok"):
+                        return ent
+                except Exception:
+                    pass
         return self._fetch_credits_fallback()
 
     def _set_last_error(self, message):
@@ -2013,6 +2212,11 @@ EXPORT_VERSION = 1
 # exported for inspection but never trusted on import: a stale cooldown or a
 # disabled flag from another machine would silently cripple the target pool.
 VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin", "lastDailyChat")
+
+# The subset of VOLATILE_FIELDS that must not round-trip through the local
+# credential file at all: they are not trusted on load and not written by save(),
+# exactly like model_cooldowns. An export still carries them (see to_dict()).
+RUNTIME_ONLY_FIELDS = ("lastError", "cooldownUntil")
 
 
 def account_to_export(account):
