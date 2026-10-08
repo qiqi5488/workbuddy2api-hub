@@ -253,6 +253,38 @@ check("and the pin is only used when the request carries nothing",
       open_with(chat("gemini-3.5-flash")) == "medium",
       open_with(chat("gemini-3.5-flash")))
 
+# A level the model's own controls cannot offer is warned about, never
+# corrected: the upstream validates loosely, so a value outside the catalogue is
+# a diagnostic signal rather than a reason to override the client.
+check("a level the catalogue offers is not flagged",
+      P.model_offers_effort("deepseek-v4.1-flash", "high") is True,
+      P.model_offers_effort("deepseek-v4.1-flash", "high"))
+check("a level the catalogue does not offer is flagged",
+      P.model_offers_effort("deepseek-v4.1-flash", "xhigh") is False,
+      P.model_offers_effort("deepseek-v4.1-flash", "xhigh"))
+check("a junk level is flagged rather than rejected",
+      P.model_offers_effort("deepseek-v4.1-flash", "bogus-zzz") is False,
+      P.model_offers_effort("deepseek-v4.1-flash", "bogus-zzz"))
+check("the case difference the upstream ignores is ignored here too",
+      P.model_offers_effort("deepseek-v4.1-flash", "MAX") is True,
+      P.model_offers_effort("deepseek-v4.1-flash", "MAX"))
+check("switching thinking off is not a mismatch",
+      P.model_offers_effort("deepseek-v4.1-flash", "none") is True
+      and P.model_offers_effort("deepseek-v4.1-flash", None) is True)
+check("a model pinned to one level never complains",
+      P.model_offers_effort("gemini-3.5-flash", "xhigh") is True,
+      P.model_offers_effort("gemini-3.5-flash", "xhigh"))
+check("and the check still sees the deepseek levels",
+      P.model_offers_effort("deepseek-v4.1-flash", "xhigh") is False,
+      P.model_offers_effort("deepseek-v4.1-flash", "xhigh"))
+# The warning must not have changed what leaves: an off-catalogue level is still
+# forwarded exactly as asked.
+offbeat = P.build_upstream_body({"model": "deepseek-v4.1-flash",
+                                 "messages": [{"role": "user", "content": "hi"}],
+                                 "reasoning": "xhigh"})
+check("an off-catalogue level is still forwarded unchanged",
+      offbeat.get("reasoning_effort") == "xhigh", offbeat.get("reasoning_effort"))
+
 # A selectable model with no client value runs at its declared default, and the
 # client's own value wins when it sends one.
 check("gpt-6-astra declares a default", P.model_default_effort("gpt-6-astra") == "high",

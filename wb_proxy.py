@@ -3978,6 +3978,29 @@ def upstream_effort_of(body, model=None):
     return model_default_effort(model) if model else None
 
 
+def model_offers_effort(model, effort):
+    """Whether the model's own controls can select `effort`.
+
+    True when the model declares no controls at all, and for the opt-out words
+    ("none"): neither is a mismatch to report, and "none" is not a level the
+    catalogue would ever list. The value is compared case-insensitively because
+    the upstream is not consistent about case - it rejects "MAX" for a model
+    that accepts "max", and silently drops a camelCase key.
+
+    Callers use this to warn, never to rewrite: the upstream validates loosely
+    (a model pinned to "medium" was measured answering 200 to "xhigh" and to
+    "bogus-zzz"), so a level absent from this list is worth reporting rather
+    than a reason to override what the client asked for.
+    """
+    supported = model_reasoning_meta(model).get("supportedEfforts")
+    if not isinstance(supported, (list, tuple)) or not supported:
+        return True
+    asked = str(effort or "").strip().lower()
+    if not asked or asked == "none":
+        return True
+    return any(asked == str(level).strip().lower() for level in supported)
+
+
 def background_request_message(reason):
     return ("這是客戶端自己發的背景請求（%s），本機代理已擋下，"
             "避免在沒有實際操作時消耗上游額度。"
@@ -9561,16 +9584,31 @@ class Handler(BaseHTTPRequestHandler):
         # never recognised - the line said client_effort='max' while the request
         # was really forwarded, and recorded, at the model default 'high'.
         given = client_effort_of(payload)
+        sent = upstream_effort_of(forwarded, payload.get("model"))
         log(
             "chat: model=%s client_effort=%r -> upstream_effort=%r stream=%s msgs=%d"
             % (
                 payload.get("model"),
                 given,
-                upstream_effort_of(forwarded, payload.get("model")),
+                sent,
                 bool(payload.get("stream")),
                 len(forwarded.get("messages") or []),
             )
         )
+        # A level the model's own controls cannot offer is reported, not
+        # corrected: the upstream validates loosely - a model pinned to "medium"
+        # was measured answering 200 to "xhigh" and to "bogus-zzz" - so a warning
+        # is the honest signal, and overriding the client would hide the request
+        # that really left. The catalogue read is the same one the resolution
+        # above already performs.
+        if not model_offers_effort(payload.get("model"), sent):
+            log("chat: model=%s was asked for effort %r, which its catalogue does"
+                " not offer (%s) - forwarding it unchanged; watch the upstream"
+                " for a rejection"
+                % (payload.get("model"), sent,
+                   ",".join(model_reasoning_meta(payload.get("model"))
+                            .get("supportedEfforts") or [])),
+                level="WARN")
         session_key = extract_session_key(self.headers, payload)
         fp = prompt_fingerprint(forwarded.get("messages"))
         want_stream = bool(payload.get("stream"))
