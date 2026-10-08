@@ -241,6 +241,16 @@ try:
     check("responses -> 403", status == 403, (status, err))
     check("and says the same thing", "已到达使用时间" in message, message)
 
+    # The deadline is enforced by the shared auth gate, so the Anthropic route
+    # has to refuse an expired key too rather than open a second way in.
+    status, err = request(
+        port, "/v1/messages", method="POST", key="KEYEXPIRED",
+        body={"model": "deepseek-v4.1-flash", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    message = ((err.get("error") or {}).get("message") or "")
+    check("anthropic messages -> 403", status == 403, (status, err))
+    check("and says the same thing", "已到达使用时间" in message, message)
+
     print()
     print("[7] live and never-expiring keys are unaffected")
 

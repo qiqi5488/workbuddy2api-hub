@@ -213,6 +213,14 @@ try:
     check("responses -> 400", status == 400, (status, err))
     check("responses names the restriction", "gpt-6-astra" in message, message)
 
+    status, err = request(
+        port, "/v1/messages", method="POST", key="KEYRESTRICTED",
+        body={"model": "gpt-6-astra", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    message = ((err.get("error") or {}).get("message") or "")
+    check("anthropic messages -> 400", status == 400, (status, err))
+    check("messages names the restriction", "gpt-6-astra" in message, message)
+
     print()
     print("[6] an allowed model reaches the upstream path (and only that stops it)")
 

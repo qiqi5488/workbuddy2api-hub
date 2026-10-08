@@ -8700,6 +8700,9 @@ class Handler(BaseHTTPRequestHandler):
             key_blocked = self._key_model_error(chat_req.get("model"))
             if key_blocked:
                 return self._anthropic_error(400, key_blocked, "invalid_request_error")
+            over_budget = self._token_limit_error()
+            if over_budget:
+                return self._anthropic_error(403, over_budget, "invalid_request_error")
             upstream, account, effort = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm)
         except ContentRejected as exc:
@@ -8885,6 +8888,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "not found", "invalid_request_error")
         if is_messages_route:
             if not self._key_ok():
+                if self.expired_entry:
+                    # A key whose deadline has passed is a different failure
+                    # from a wrong one: the same 403 the shared gate gives the
+                    # other routes, in this route's error envelope.
+                    return self._anthropic_error(
+                        403, self._expired_key_message(self.expired_entry),
+                        "invalid_request_error")
                 return self._anthropic_error(
                     401, "missing or invalid API key", "authentication_error")
         elif not self._authorized():

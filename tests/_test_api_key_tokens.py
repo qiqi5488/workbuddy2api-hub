@@ -250,6 +250,17 @@ try:
     check("responses -> 403", status == 403, (status, err))
     check("and says the same thing", "额度已用尽" in message, message)
 
+    # The Anthropic endpoint answers with its own error envelope, so the cap
+    # has to be enforced on that route as well - otherwise a spent key reaches
+    # the upstream through /v1/messages and burns account quota again.
+    status, err = request(
+        port, "/v1/messages", method="POST", key="KEYCAPPED",
+        body={"model": "deepseek-v4.1-flash", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    message = ((err.get("error") or {}).get("message") or "")
+    check("anthropic messages -> 403", status == 403, (status, err))
+    check("and says the same thing", "额度已用尽" in message, message)
+
     print()
     print("[4] a key under its cap, and an unlimited key, are unaffected")
 
@@ -265,6 +276,16 @@ try:
         body={"model": "deepseek-v4.1-flash",
               "messages": [{"role": "user", "content": "hi"}]})
     check("an unlimited key is untouched by the gate", status == 503, (status, err))
+
+    status, err = request(
+        port, "/v1/messages", method="POST", key="KEYBELOW",
+        body={"model": "deepseek-v4.1-flash", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    # 502 and 503 both mean "the cap gate let it through, the pool is empty":
+    # the Anthropic route reports 502 where the other two report 503 (an
+    # upstream inconsistency in that handler, unrelated to the cap).
+    check("a key under its cap passes the gate on /v1/messages too",
+          status in (502, 503), (status, err))
 
     print()
     print("[5] the panel reports, edits and resets the cap")
