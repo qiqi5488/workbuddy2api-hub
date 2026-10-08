@@ -127,6 +127,39 @@ check("a nested object with no effort still gets the model default",
            "reasoning": {"summary": "auto"}}))
       == (P.model_default_effort("deepseek-v4.1-flash") or "high"))
 
+# The spelling the production fleet actually uses: the level as a bare string in
+# "reasoning". It was neither read nor translated, so the injection branch saw
+# "asked for nothing" and every one of those requests ran, and was recorded, at
+# the model default - 94% of a day's traffic, in the deployment that reported it.
+for level in ("max", "xhigh", "low", "medium", "off", "MAX"):
+    bare = P.build_upstream_body({"model": "deepseek-v4.1-flash",
+                                  "messages": [{"role": "user", "content": "hi"}],
+                                  "reasoning": level})
+    check("a bare string %r reaches the outbound body" % level,
+          bare.get("reasoning_effort") == level, bare.get("reasoning_effort"))
+    check("and %r is what the usage row records" % level,
+          P.upstream_effort_of(bare) == level, P.upstream_effort_of(bare))
+    check("and %r does not leave the reasoning key on the body" % level,
+          "reasoning" not in bare, sorted(bare))
+
+blank = P.build_upstream_body({"model": "deepseek-v4.1-flash",
+                               "messages": [{"role": "user", "content": "hi"}],
+                               "reasoning": "   "})
+check("a blank string is treated as no answer, not as a level",
+      P.client_effort_of({"reasoning": "   "}) is None
+      and P.upstream_effort_of(blank)
+      == (P.model_default_effort("deepseek-v4.1-flash") or "high"),
+      (P.client_effort_of({"reasoning": "   "}), P.upstream_effort_of(blank)))
+check("the bare string is trimmed of surrounding space",
+      P.client_effort_of({"reasoning": " max "}) == "max",
+      P.client_effort_of({"reasoning": " max "}))
+check("a flat key still outranks the bare string",
+      P.upstream_effort_of(P.build_upstream_body(
+          {"model": "deepseek-v4.1-flash",
+           "messages": [{"role": "user", "content": "hi"}],
+           "reasoning_effort": "low",
+           "reasoning": "max"})) == "low")
+
 
 class _StubPool(object):
     """The parts of the account pool open_upstream() touches."""

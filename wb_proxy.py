@@ -3917,14 +3917,18 @@ def background_request_reason(payload):
 
 
 def client_effort_of(body):
-    """The effort the request itself carries, under any of the three spellings.
+    """The effort the request itself carries, under any of the four spellings.
 
-    Flat "reasoning_effort" and camelCase "reasoningEffort", then the nested
-    form a Responses-style client sends on a chat call - "reasoning": {"effort":
-    ...} - which responses_to_chat() already reads on its own path. Reading only
-    the flat pair is what made the deepseek injection below treat such a request
-    as "asked for nothing" and overwrite it with the model default: the log line
-    said client_effort='max' while upstream_effort resolved to 'high'.
+    Flat "reasoning_effort", camelCase "reasoningEffort", the nested object a
+    Responses-style client sends on a chat call - "reasoning": {"effort": ...} -
+    and the bare string some clients put straight in "reasoning".
+
+    Missing any one of them is not a cosmetic problem: the deepseek injection in
+    build_upstream_body() reads this same function, so an unrecognised spelling
+    means "asked for nothing" there and gets overwritten with the model default.
+    That is how a fleet of requests asking for max and xhigh all ran - and were
+    recorded - as high, while the diagnostic line printed the client's value from
+    its own fallback chain and looked right.
     """
     if not isinstance(body, dict):
         return None
@@ -3934,6 +3938,8 @@ def client_effort_of(body):
     reasoning = body.get("reasoning")
     if isinstance(reasoning, dict):
         return reasoning.get("effort") or None
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
     return None
 
 
@@ -4072,13 +4078,15 @@ def build_upstream_body(payload):
     # upstream to ignore unknown keys.
     for _marker in [k for k in body if str(k).startswith("_")]:
         body.pop(_marker, None)
-    # A nested "reasoning" object is not part of the chat protocol this upstream
-    # speaks, and leaving it on the body only invites it to be read as an
-    # unknown key. Translate it to the flat spelling the upstream does read.
-    if isinstance(body.get("reasoning"), dict):
-        body.pop("reasoning", None)
-        if effort and not (body.get("reasoning_effort") or body.get("reasoningEffort")):
+    # A "reasoning" key is not part of the chat protocol this upstream speaks,
+    # in either of its client-side shapes: the nested object and the bare string
+    # both mean "the effort lives here". Translate it to the flat spelling the
+    # upstream does read, rather than forwarding an unknown key.
+    if "reasoning" in body and not (body.get("reasoning_effort")
+                                    or body.get("reasoningEffort")):
+        if effort:
             body["reasoning_effort"] = effort
+    body.pop("reasoning", None)
     # dict(payload) 會把原始模型名一起帶過去，所以別名要在這裡覆蓋回去
     body["model"] = model
     body["messages"] = messages
@@ -9537,8 +9545,11 @@ class Handler(BaseHTTPRequestHandler):
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
         forwarded = build_upstream_body(payload)
-        given = client_effort_of(payload) or payload.get("reasoning") \
-            or payload.get("thinking") or payload.get("enable_thinking")
+        # Read through the same function that decided what to forward. An extra
+        # fallback over raw request keys here would print a value the gateway
+        # never recognised - the line said client_effort='max' while the request
+        # was really forwarded, and recorded, at the model default 'high'.
+        given = client_effort_of(payload)
         log(
             "chat: model=%s client_effort=%r -> upstream_effort=%r stream=%s msgs=%d"
             % (
