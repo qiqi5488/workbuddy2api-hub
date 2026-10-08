@@ -3946,33 +3946,35 @@ def client_effort_of(body):
 def upstream_effort_of(body, model=None):
     """The reasoning effort a request actually runs at, or None when unknown.
 
-    Resolved the way the upstream will apply it:
+    Answers with what was actually forwarded, because that is the only value we
+    can stand behind: the request path only substitutes an effort when the client
+    left the field out, so the body carries either the client's level or the
+    model default, and the upstream is not known to pin a model regardless of the
+    field. A deployment whose catalog carried reasoning.effort="high" for a model
+    the upstream happily ran at "xhigh" is what made the log line, the usage row
+    and the panel badge disagree with the request that really left.
 
-      - a model the catalog pins to one level (reasoning.effort, no
-        supportedEfforts) always runs there: the picker offers no choice for it,
-        so a value the request carries anyway does not change the answer;
       - a request that switched thinking off, or asked for "none", ran without
         reasoning and nothing below overrides that;
-      - otherwise the client's own value wins, under either spelling;
+      - otherwise the client's own value wins, under any spelling;
+      - otherwise a model the catalog pins to one level reports that level: the
+        picker offers no choice for it, so the request carries nothing and the
+        pin is the best answer available;
       - otherwise the model's declared defaultEffort applies.
-
-    Reading the body alone is not enough for the last two: the gateway only
-    writes an effort into the body for the models it injects for, so a plain
-    request to a pinned model would otherwise be reported as "no effort".
     """
-    given = client_effort_of(body)
-    if model:
-        fixed = model_fixed_effort(model)
-        if fixed:
-            return fixed
     thinking = (body or {}).get("thinking") if isinstance(body, dict) else None
     if isinstance(thinking, dict) and \
             str(thinking.get("type") or "").strip().lower() == "disabled":
         return "none"
+    given = client_effort_of(body)
     if str(given or "").strip().lower() == "none":
         return "none"
     if given:
         return given
+    if model:
+        fixed = model_fixed_effort(model)
+        if fixed:
+            return fixed
     return model_default_effort(model) if model else None
 
 
@@ -4087,6 +4089,15 @@ def build_upstream_body(payload):
         if effort:
             body["reasoning_effort"] = effort
     body.pop("reasoning", None)
+    # The camelCase spelling is not read either, and the upstream does not just
+    # ignore it: measured on the live gateway, reasoningEffort="max" came back
+    # with reasoning_tokens 0 in five out of five samples, against 136 for the
+    # flat spelling on the same prompt. The flat key is what it reads, so mirror
+    # the value onto it. The camelCase key is left in place: a client that sent
+    # it expects it back on the echo, and one unknown key is what the upstream
+    # already tolerated.
+    if "reasoning_effort" not in body and body.get("reasoningEffort"):
+        body["reasoning_effort"] = body["reasoningEffort"]
     # dict(payload) 會把原始模型名一起帶過去，所以別名要在這裡覆蓋回去
     body["model"] = model
     body["messages"] = messages

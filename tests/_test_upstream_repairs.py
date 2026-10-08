@@ -125,9 +125,15 @@ explicit = deepseek_body(reasoning_effort="low")
 check("an explicit effort is left alone", explicit["reasoning_effort"] == "low")
 
 camel_explicit = deepseek_body(reasoningEffort="max")
-check("a camelCase explicit effort is left alone",
-      camel_explicit.get("reasoningEffort") == "max"
-      and "reasoning_effort" not in camel_explicit, camel_explicit.get("reasoning_effort"))
+# Not merely "left alone": the upstream does not read the camelCase spelling, and
+# it does not ignore it either - measured live, reasoningEffort="max" answered
+# with reasoning_tokens 0 in five of five samples against 136 for the flat key on
+# the same prompt. The flat key is what it reads, so the value is mirrored onto it
+# while the client's own key stays on the body.
+check("a camelCase explicit effort keeps its own key",
+      camel_explicit.get("reasoningEffort") == "max", camel_explicit.get("reasoningEffort"))
+check("and is mirrored onto the flat key the upstream reads",
+      camel_explicit.get("reasoning_effort") == "max", camel_explicit.get("reasoning_effort"))
 
 disabled = deepseek_body(thinking={"type": "disabled"})
 check("thinking disabled is not re-enabled",

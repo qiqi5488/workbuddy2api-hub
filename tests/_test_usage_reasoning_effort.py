@@ -70,15 +70,18 @@ old = [r for r in got["rows"] if r.get("model") == "hy3"][0]
 check("a row written without the field stays without it",
       "reasoning_effort" not in old, old)
 
-# The body builder reads both client spellings and only fills in the model
-# default when the client asked for nothing, so a camelCase request keeps
-# "reasoningEffort" and never gains a snake-case key. Reading only the snake
-# spelling would report None for a request that really ran at "max".
+# The body builder accepts every client spelling and only fills in the model
+# default when the client asked for nothing. The camelCase spelling is mirrored
+# onto the flat key because the upstream does not read it - measured live,
+# reasoningEffort="max" produced reasoning_tokens 0 in five of five samples
+# against 136 for the flat key on the same prompt.
 camel = P.build_upstream_body({"model": "deepseek-v4.1-flash",
                                "messages": [{"role": "user", "content": "hi"}],
                                "reasoningEffort": "max"})
-check("a camelCase request keeps the camelCase key",
-      "reasoning_effort" not in camel, camel.get("reasoning_effort"))
+check("a camelCase request keeps its own key",
+      camel.get("reasoningEffort") == "max", camel.get("reasoningEffort"))
+check("a camelCase request also carries the flat key the upstream reads",
+      camel.get("reasoning_effort") == "max", camel.get("reasoning_effort"))
 check("the effective effort is read from the camelCase spelling",
       P.upstream_effort_of(camel) == "max", P.upstream_effort_of(camel))
 snake = P.build_upstream_body({"model": "deepseek-v4.1-flash",
@@ -239,9 +242,16 @@ check("so the pinned level reaches the usage row",
       rows()[-1].get("reasoning_effort") == "medium", rows()[-1].get("reasoning_effort"))
 check("kimi-k3 is pinned the same way", open_with(chat("kimi-k3")) == "medium",
       open_with(chat("kimi-k3")))
-check("a pinned model ignores a level the request carries anyway",
-      open_with(chat("gemini-3.5-flash", reasoning_effort="max")) == "medium",
+# The pin is a fallback, not an override. A deployment reported every request as
+# "high" because its catalog carried reasoning.effort="high" for a model the
+# upstream ran at the level the request asked for, so the log line, the usage row
+# and the panel badge all named a level the request never ran at.
+check("a level the request carries is reported, not replaced by the pin",
+      open_with(chat("gemini-3.5-flash", reasoning_effort="max")) == "max",
       open_with(chat("gemini-3.5-flash", reasoning_effort="max")))
+check("and the pin is only used when the request carries nothing",
+      open_with(chat("gemini-3.5-flash")) == "medium",
+      open_with(chat("gemini-3.5-flash")))
 
 # A selectable model with no client value runs at its declared default, and the
 # client's own value wins when it sends one.
