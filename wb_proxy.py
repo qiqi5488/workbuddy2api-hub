@@ -3597,16 +3597,24 @@ def background_request_reason(payload):
 
 
 def client_effort_of(body):
-    """The effort the request itself carries, under either client spelling.
+    """The effort the request itself carries, under any of the three spellings.
 
-    build_upstream_body() reads both "reasoning_effort" and "reasoningEffort",
-    and only fills in the model default for the models it injects for - so a
-    camelCase request keeps the camelCase key, and a request to a model the
-    catalog pins to one level carries no effort at all.
+    Flat "reasoning_effort" and camelCase "reasoningEffort", then the nested
+    form a Responses-style client sends on a chat call - "reasoning": {"effort":
+    ...} - which responses_to_chat() already reads on its own path. Reading only
+    the flat pair is what made the deepseek injection below treat such a request
+    as "asked for nothing" and overwrite it with the model default: the log line
+    said client_effort='max' while upstream_effort resolved to 'high'.
     """
     if not isinstance(body, dict):
         return None
-    return body.get("reasoning_effort") or body.get("reasoningEffort")
+    effort = body.get("reasoning_effort") or body.get("reasoningEffort")
+    if effort:
+        return effort
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        return reasoning.get("effort") or None
+    return None
 
 
 def upstream_effort_of(body, model=None):
@@ -3675,7 +3683,10 @@ def build_upstream_body(payload):
     thinking_type = ""
     if isinstance(thinking, dict):
         thinking_type = str(thinking.get("type") or "").strip().lower()
-    effort = payload.get("reasoning_effort") or payload.get("reasoningEffort")
+    # One reader for all three client spellings, so the thinking decision below,
+    # the deepseek injection further down, and the value logged on the usage row
+    # can never disagree about what the request asked for.
+    effort = client_effort_of(payload)
     thinking_enabled = False
     if str(model).lower().startswith("deepseek"):
         if thinking_type == "enabled":
@@ -3696,6 +3707,13 @@ def build_upstream_body(payload):
     # upstream to ignore unknown keys.
     for _marker in [k for k in body if str(k).startswith("_")]:
         body.pop(_marker, None)
+    # A nested "reasoning" object is not part of the chat protocol this upstream
+    # speaks, and leaving it on the body only invites it to be read as an
+    # unknown key. Translate it to the flat spelling the upstream does read.
+    if isinstance(body.get("reasoning"), dict):
+        body.pop("reasoning", None)
+        if effort and not (body.get("reasoning_effort") or body.get("reasoningEffort")):
+            body["reasoning_effort"] = effort
     # dict(payload) 會把原始模型名一起帶過去，所以別名要在這裡覆蓋回去
     body["model"] = model
     body["messages"] = messages

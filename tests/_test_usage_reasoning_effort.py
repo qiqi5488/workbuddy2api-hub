@@ -92,6 +92,41 @@ check("a request that asks for nothing gets the model default",
       P.upstream_effort_of(quiet) == (P.model_default_effort("deepseek-v4.1-flash") or "high"),
       P.upstream_effort_of(quiet))
 
+# A Responses-style client puts the effort in a nested object. Reading only the
+# flat pair made the deepseek injection treat it as "asked for nothing" and
+# overwrite it with the model default: the log line reported client_effort='max'
+# while upstream_effort resolved to 'high', and the request really ran at high.
+nested = P.build_upstream_body({"model": "deepseek-v4.1-flash",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "reasoning": {"effort": "max"}})
+check("the nested spelling reaches the outbound body",
+      nested.get("reasoning_effort") == "max", nested.get("reasoning_effort"))
+check("and the nested object is not forwarded as an unknown key",
+      "reasoning" not in nested, sorted(nested))
+check("the effective effort is read from the nested spelling",
+      P.upstream_effort_of(nested) == "max", P.upstream_effort_of(nested))
+check("a nested level the model does not offer is passed through, not defaulted",
+      P.upstream_effort_of(P.build_upstream_body(
+          {"model": "deepseek-v4.1-flash",
+           "messages": [{"role": "user", "content": "hi"}],
+           "reasoning": {"effort": "xhigh"}})) == "xhigh",
+      P.upstream_effort_of(P.build_upstream_body(
+          {"model": "deepseek-v4.1-flash",
+           "messages": [{"role": "user", "content": "hi"}],
+           "reasoning": {"effort": "xhigh"}})))
+check("the flat spelling still wins over the nested one",
+      P.upstream_effort_of(P.build_upstream_body(
+          {"model": "deepseek-v4.1-flash",
+           "messages": [{"role": "user", "content": "hi"}],
+           "reasoning_effort": "low",
+           "reasoning": {"effort": "max"}})) == "low")
+check("a nested object with no effort still gets the model default",
+      P.upstream_effort_of(P.build_upstream_body(
+          {"model": "deepseek-v4.1-flash",
+           "messages": [{"role": "user", "content": "hi"}],
+           "reasoning": {"summary": "auto"}}))
+      == (P.model_default_effort("deepseek-v4.1-flash") or "high"))
+
 
 class _StubPool(object):
     """The parts of the account pool open_upstream() touches."""
