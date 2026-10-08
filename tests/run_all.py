@@ -18,9 +18,44 @@ import subprocess
 import sys
 import tempfile
 
+# Suite summaries are printed verbatim, and some of them are written in
+# Chinese. A Windows console defaults to a legacy ANSI code page (cp1252 on
+# the GitHub runner), where those characters cannot be encoded and the whole
+# run dies with UnicodeEncodeError before the summary line. Pin both streams
+# to UTF-8 and never fail on a glyph the console cannot render: the log keeps
+# the real text on every platform.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # A wrapped or replaced stream without reconfigure(): keep it as is.
+        pass
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TAIL_LINES = 25
+
+
+def _force_utf8_output():
+    """Make this process's stdout/stderr survive non-ASCII suite summaries.
+
+    The suites are run with PYTHONIOENCODING=utf-8 so a child can print its
+    Chinese labels, and their output is read back from a utf-8 log file. This
+    process then re-prints those same lines, and on the Windows CI runner its
+    own stdout is cp1252 - so the very first Chinese summary line aborted the
+    whole run with UnicodeEncodeError, after the suites themselves had passed.
+    Reconfiguring here keeps the two halves consistent; errors="replace" means
+    an exotic code point degrades to '?' instead of killing the run.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_force_utf8_output()
 
 
 def suites(pattern):
@@ -69,6 +104,16 @@ def main(argv):
     # be utf-8 too - on the CI Windows runner the locale is cp1252 and a
     # Chinese label would otherwise abort the suite with UnicodeEncodeError.
     env["PYTHONIOENCODING"] = "utf-8"
+    # This script has the same problem, for the same reason: it echoes each
+    # suite's last line (and its whole tail on failure) on its own stdout. On
+    # the CI Windows runner that stdout is a cp1252 pipe, so the first Chinese
+    # label aborts the run with UnicodeEncodeError before the summary is even
+    # printed. A real console is already utf-8 on Windows, so this only changes
+    # the pipe case.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, OSError):
+        pass
     have_node = shutil.which("node") is not None
 
     selected = suites(pattern)

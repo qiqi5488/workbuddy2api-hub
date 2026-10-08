@@ -26,7 +26,18 @@ MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024)
 # of chat/responses requests in flight; dashboard and management calls are not
 # affected. Excess callers wait briefly, then get a 503 instead of queueing
 # forever.
-MAX_CONCURRENT_CHAT = int(os.environ.get("WB_MAX_CONCURRENT_CHAT", 32))
+#
+# The ceiling is a fixed 32 by default, which has nothing to do with how many
+# accounts the pool holds: a 200-account gateway and a 5-account gateway share
+# it. Set WB_MAX_CONCURRENT_CHAT=auto to size it from the pool instead - one
+# slot per ready account, never below 32. See resize_chat_slots().
+_CHAT_SLOTS_ENV = os.environ.get("WB_MAX_CONCURRENT_CHAT", "32").strip().lower()
+CHAT_SLOTS_AUTO = _CHAT_SLOTS_ENV in ("auto", "pool", "dynamic")
+CHAT_SLOTS_FLOOR = 32
+try:
+    MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR if CHAT_SLOTS_AUTO else int(_CHAT_SLOTS_ENV)
+except ValueError:
+    MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR
 CHAT_SLOT_WAIT_SECONDS = float(os.environ.get("WB_CHAT_SLOT_WAIT", 30))
 import socket
 import sys
@@ -43,6 +54,9 @@ import wb_pricing
 import wb_settings
 import wb_webtools
 import wb_identity
+import wb_prompt
+import wb_modelsdev
+import wb_probes
 IS_WINDOWS = os.name == "nt"
 def launcher_hint(port):
     """Platform-appropriate launcher command for starting on another port."""
@@ -176,6 +190,36 @@ def cors_origin_allowed(path):
 _lock = threading.Lock()
 _login_lock = threading.Lock()
 _chat_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CHAT)
+def resize_chat_slots(ready_accounts):
+    """Size the chat concurrency ceiling from the pool, when asked to.
+
+    With WB_MAX_CONCURRENT_CHAT=auto the ceiling becomes one slot per ready
+    account (never below CHAT_SLOTS_FLOOR), so the gateway scales with the pool
+    it actually has instead of a constant that fits neither a 5-account nor a
+    200-account deployment. A fixed numeric WB_MAX_CONCURRENT_CHAT keeps the
+    1.6.x behaviour and makes this a no-op.
+
+    Only ever grows the ceiling. Requests already holding a slot keep theirs -
+    replacing the semaphore cannot revoke a permit - so a shrink would let the
+    in-flight count exceed the new ceiling and the surplus releases would raise
+    ValueError from BoundedSemaphore. Growing is the direction that matters:
+    the pool is loaded once at startup, so in practice this runs before the
+    listener accepts anything.
+    """
+    global _chat_slots, MAX_CONCURRENT_CHAT
+    if not CHAT_SLOTS_AUTO:
+        return MAX_CONCURRENT_CHAT
+    try:
+        wanted = max(CHAT_SLOTS_FLOOR, int(ready_accounts or 0))
+    except (TypeError, ValueError):
+        return MAX_CONCURRENT_CHAT
+    if wanted <= MAX_CONCURRENT_CHAT:
+        return MAX_CONCURRENT_CHAT
+    MAX_CONCURRENT_CHAT = wanted
+    _chat_slots = threading.BoundedSemaphore(wanted)
+    log("chat slots : %d (one per ready account; WB_MAX_CONCURRENT_CHAT=auto)"
+        % wanted)
+    return wanted
 _login_attempts = {}  # ip -> list of timestamp
 def _prune_login_attempts(now=None, window=60):
     """Drop stale per-IP entries so the dict cannot grow without bound.
@@ -312,18 +356,43 @@ def key_token_reset(key_id):
         _key_tokens.pop(str(key_id), None)
         _persist_key_tokens()
 
+
+def normalize_usage_cache_aliases(usage):
+    """Write the best cache-hit value into every alias.
+
+    Some responses carry the real hit in prompt_tokens_details.cached_tokens
+    while also emitting cache_read_input_tokens: 0 / cached_tokens: 0
+    compatibility aliases; strict downstream parsers may prefer the zero
+    aliases and lose the hit. Mutates and returns the usage dict.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    best = _best_cached_tokens(usage)
+    if best <= 0:
+        return usage
+    usage["cache_read_input_tokens"] = best
+    usage["cached_tokens"] = best
+    usage["prompt_cache_hit_tokens"] = best
+    prompt_details = dict(usage.get("prompt_tokens_details") or {})
+    prompt_details["cached_tokens"] = best
+    usage["prompt_tokens_details"] = prompt_details
+    if isinstance(usage.get("input_tokens_details"), dict):
+        input_details = dict(usage["input_tokens_details"])
+        input_details["cached_tokens"] = best
+        usage["input_tokens_details"] = input_details
+    return usage
+
+
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
     if not usage:
         return {}
     details = usage.get("completion_tokens_details") or {}
-    prompt_details = usage.get("prompt_tokens_details") or {}
     return {
         "prompt_tokens": usage.get("prompt_tokens") or 0,
         "completion_tokens": usage.get("completion_tokens") or 0,
         "reasoning_tokens": details.get("reasoning_tokens") or 0,
-        "cached_tokens": usage.get("prompt_cache_hit_tokens") or details.get("cached_tokens") \
-            or prompt_details.get("cached_tokens") or 0,
+        "cached_tokens": _best_cached_tokens(usage),
         "total_tokens": usage.get("total_tokens") or 0,
         "credit": usage.get("credit") or 0,
     }
@@ -1304,6 +1373,88 @@ _count_lock = threading.Lock()
 _COUNT_TTL = float(os.environ.get("WB_COUNT_TTL", 30))
 
 
+def usage_timeseries(realm=None, range=None, since=None, until=None,
+                     bucket_seconds=None):
+    """Bucketed token/credit series for the analytics chart.
+
+    Bucket size auto-scales with the window: minute (<=6h), hour (<=14d),
+    day otherwise; an explicit bucket_seconds overrides it. Completed
+    requests contribute tokens; every non-client-aborted row contributes
+    credit (money already spent). The most recent credited requests ride
+    along so the panel can show a credit history without another endpoint.
+    """
+    r = realm_scope(realm, CURRENT_REALM)
+    lo, hi = range_window(range, since, until)
+    if hi is None:
+        hi = time.time()
+    if lo is None:
+        lo = hi - 86400
+    span = max(1.0, hi - lo)
+    if bucket_seconds:
+        step = max(60, int(bucket_seconds))
+    elif span <= 6 * 3600:
+        step = 60
+    elif span <= 14 * 86400:
+        step = 3600
+    else:
+        step = 86400
+    buckets = {}
+    credits = []
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if r and not row_matches_realm(row, r):
+                    continue
+                at = row.get("at") or 0
+                if at < lo or at > hi:
+                    continue
+                key = int((at - lo) // step)
+                bucket = buckets.setdefault(key, {
+                    "at": lo + key * step, "requests": 0, "errors": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                    "reasoning_tokens": 0, "cached_tokens": 0,
+                    "total_tokens": 0, "credit": 0.0,
+                })
+                outcome = row_outcome(row)
+                if outcome == "completed":
+                    bucket["requests"] += 1
+                    for field in ("prompt_tokens", "completion_tokens",
+                                  "reasoning_tokens", "cached_tokens",
+                                  "total_tokens"):
+                        bucket[field] += (row.get(field) or 0)
+                else:
+                    bucket["errors"] += 1
+                credit = row.get("credit") or 0
+                if outcome != "client_aborted":
+                    bucket["credit"] += credit
+                if credit > 0:
+                    credits.append({
+                        "at": at, "iso": row.get("iso") or "",
+                        "model": row.get("model") or "",
+                        "account": row.get("account") or "",
+                        "credit": credit,
+                        "total_tokens": row.get("total_tokens") or 0,
+                    })
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("usage timeseries read failed: %s" % exc)
+    credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
+    return {
+        "ok": True, "realm": r or "all", "bucket_seconds": step,
+        "since": lo, "until": hi,
+        "series": [buckets[key] for key in sorted(buckets)],
+        "credits": credits[:50],
+    }
+
+
 def count_usage_rows(realm=None):
     """Cached row count - substring match instead of a full JSON parse.
 
@@ -2191,10 +2342,11 @@ def runtime_settings_view():
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.6.15",
+        "version": "1.6.16",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -2217,6 +2369,24 @@ AFFINITY_BY_PREFIX = os.environ.get("WB_AFFINITY_BY_PREFIX", "1").lower() not in
     "0", "false", "no", "off")
 AFFINITY_DEBUG = os.environ.get("WB_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
+# 亲和的上限：对话超过这么多条消息后不再绑定账号。
+#
+# 为什么需要上限：亲和把整段对话钉在同一个账号上，而对话的上下文是单调
+# 增长的，于是那一个账号要反复接收越来越大的请求体。实测（wk4 实例，
+# 2026-10-08，333 个请求）请求体与上游断连率的关系：
+#
+#     msgs <150    82 个请求   断连率  0.0%
+#     msgs 150-300 59 个请求   断连率  3.4%
+#     msgs 300-400 64 个请求   断连率  7.8%
+#     msgs 400-500 50 个请求   断连率 10.0%
+#
+# 断连（TimeoutError / RemoteDisconnected）会触发重试，把一个 8.8s 的请求
+# 拖到 11.6s，首字延迟随之翻倍。超过阈值后放弃亲和，让这个对话重新参与
+# 轮询：代价是它丢掉前缀缓存，收益是断连和重试消失。
+#
+# 阈值不能设得太低，否则会波及正常长度的对话（本实例 94% 的请求缓存命中率
+# 来自亲和）。设 0 表示不限制，保持 1.6.x 的原有行为。
+AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
 def derive_affinity_key(messages):
     """Derive a stable affinity key from a conversation's stable prefix.
     The first two messages (system + first user turn) stay byte-identical for
@@ -2224,12 +2394,21 @@ def derive_affinity_key(messages):
     that conversation to the same upstream account - exactly what prompt
     caching needs. Distinct conversations differ in their first user turn and
     therefore still spread across the pool.
+
+    Conversations longer than AFFINITY_MAX_MSGS deliberately get no key: they
+    are the ones whose oversized bodies make the upstream drop the connection,
+    and pinning them only guarantees the next turn is oversized too.
     """
     if not AFFINITY_BY_PREFIX:
         return None
     try:
         msgs = messages or []
         if not msgs:
+            return None
+        if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
+            if AFFINITY_DEBUG:
+                log("affinity: skip %d msgs (> %d), letting the pool rotate"
+                    % (len(msgs), AFFINITY_MAX_MSGS))
             return None
         head = msgs[:2]
         blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -2549,12 +2728,24 @@ def model_entry(mid, meta):
         "modality": "+".join(inputs) + "->text",
     }
     # ---- limits ----
-    if meta.get("maxInputTokens"):
-        item["context_length"] = meta["maxInputTokens"]
-        item["max_input_tokens"] = meta["maxInputTokens"]
-    if meta.get("maxOutputTokens"):
-        item["max_output_tokens"] = meta["maxOutputTokens"]
-        item["max_completion_tokens"] = meta["maxOutputTokens"]
+    # Four-level lookup: remote > built-in knowledge table > local model.json
+    # cache > models.dev (asynchronously warmed; never blocks). context_length
+    # always has a value (1M when unknown - a high estimate is safer than a
+    # low one); max_output_tokens is omitted when unknown.
+    ctx_value, out_value, _limit_source = wb_modelsdev.lookup(
+        mid, meta.get("maxInputTokens"), meta.get("maxOutputTokens"),
+        directory=ACCOUNTS_DIR)
+    item["context_length"] = ctx_value
+    item["max_input_tokens"] = ctx_value
+    if out_value:
+        item["max_output_tokens"] = out_value
+        item["max_completion_tokens"] = out_value
+    # Annotate the measured upstream clamp (from output_probes.json) without
+    # overriding the model's spec value; the panel shows "钳制 N×" beside it.
+    clamp = wb_probes.clamp_for(ACCOUNTS_DIR, mid)
+    if clamp:
+        item["output_clamp"] = clamp
+        item["max_output_tokens_clamped"] = clamp
     ctx = (meta.get("contextWindow") or {}).get("supportedLengths")
     if ctx:
         item["context_windows"] = ctx
@@ -2930,6 +3121,11 @@ def clean_chunk(raw):
     except Exception:
         return raw
     changed = False
+    if isinstance(obj.get("usage"), dict):
+        before = dict(obj["usage"])
+        normalize_usage_cache_aliases(obj["usage"])
+        if obj["usage"] != before:
+            changed = True
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
         if not isinstance(delta, dict):
@@ -3132,6 +3328,91 @@ def sanitize_messages(messages):
 # ---------------------------------------------------------------------------
 # Tool-call pairing repair
 # ---------------------------------------------------------------------------
+def _empty_content(value):
+    """True when an assistant message carries no content at all.
+
+    None / "" / [] all mean "no content": clients disagree on which empty
+    shape they emit, and a batch split into adjacent assistant messages must
+    merge for either shape (a missed [] was the original 11148 case).
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, list):
+        return len(value) == 0
+    return False
+
+
+def _merge_reasoning_content(dst, src):
+    """Fold src's reasoning_content into dst, newline-joined when both exist."""
+    rc = src.get("reasoning_content")
+    if not isinstance(rc, str) or not rc:
+        return
+    prev = dst.get("reasoning_content")
+    if isinstance(prev, str) and prev:
+        dst["reasoning_content"] = prev + "\n" + rc
+    else:
+        dst["reasoning_content"] = rc
+
+
+def merge_adjacent_tool_calls(messages):
+    """Merge back-to-back assistant tool_calls messages into one.
+
+    Some OpenAI-compatible agent clients replay a parallel batch as several
+    adjacent assistant messages, each carrying one tool_call. DeepSeek-family
+    upstreams answer 400 / code 11148 (tool_call_sequence_broken) for that
+    shape and retire the conversation, because every retry replays the same
+    history and switching accounts cannot help. Merging the declarations
+    restores the shape the upstream accepts.
+
+    Conditions are strict, so no semantics are invented:
+      - the messages must be adjacent;
+      - the trailing message must have empty content (None/""/[]);
+      - the leading message must already be an assistant with tool_calls.
+
+    A second form folds a plain assistant's string content into a preceding
+    tool_calls assistant that has no content of its own (the same split batch
+    replayed in the other order). reasoning_content is preserved either way,
+    because DeepSeek multi-turn thinking requires it back.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages, False
+    out = []
+    changed = False
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        if m.get("role") == "assistant" and out:
+            prev = out[-1] if isinstance(out[-1], dict) else None
+            if prev is not None and prev.get("role") == "assistant":
+                tcs = m.get("tool_calls")
+                prev_calls = prev.get("tool_calls")
+                # Form 1: this message declares tool calls and has no content.
+                if (isinstance(tcs, list) and tcs
+                        and _empty_content(m.get("content"))
+                        and isinstance(prev_calls, list) and prev_calls):
+                    prev["tool_calls"] = prev_calls + tcs
+                    _merge_reasoning_content(prev, m)
+                    changed = True
+                    continue
+                # Form 2: plain string content folds into a preceding
+                # content-less tool_calls assistant.
+                if ("tool_calls" not in m
+                        and isinstance(m.get("content"), str) and m["content"]
+                        and isinstance(prev_calls, list) and prev_calls
+                        and _empty_content(prev.get("content"))):
+                    prev["content"] = m["content"]
+                    _merge_reasoning_content(prev, m)
+                    changed = True
+                    continue
+        out.append(m)
+    if not changed:
+        return messages, False
+    return out, True
+
+
 def repack_tool_result_blocks(messages):
     """Keep a tool_calls batch and its results adjacent.
 
@@ -3262,6 +3543,45 @@ def cleanup_orphan_tool_calls(messages):
     if not changed:
         return messages, False
     return out, True
+
+
+def is_truncated_arguments(raw):
+    """True when a non-empty tool-arguments string is not valid JSON.
+
+    A stream cut off by max_tokens or a dropped connection leaves the last
+    tool call with half-written JSON. An empty/whitespace string is a legal
+    no-argument tool, and any parseable JSON (including null/scalars/arrays)
+    is the model's own output for the client to validate - only non-empty
+    unparsable strings count as truncation.
+    """
+    if not isinstance(raw, str):
+        return False
+    trimmed = raw.strip()
+    if not trimmed:
+        return False
+    try:
+        json.loads(trimmed)
+        return False
+    except Exception:
+        return True
+
+
+def drop_truncated_tool_calls(calls):
+    """Return the tool calls whose arguments are not half-written JSON."""
+    if not isinstance(calls, list):
+        return calls
+    kept = []
+    for call in calls:
+        if not isinstance(call, dict):
+            kept.append(call)
+            continue
+        fn = call.get("function")
+        if isinstance(fn, dict) and is_truncated_arguments(fn.get("arguments")):
+            continue
+        kept.append(call)
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek Multi-turn Consistency: reasoning_content backfill
 # ---------------------------------------------------------------------------
@@ -3674,6 +3994,48 @@ def key_model_message(entry, model):
             % (name, asked, allowed))
 
 
+# Process-memory degradation window: content-blocked passthrough/append
+# traffic switches to the minimal neutral prompt until the next 00:00 CST
+# (panel degrade.go). Restarts clear it, which is fine - the next rejection
+# re-triggers it.
+PROMPT_DEGRADE = wb_prompt.DegradeGate()
+
+
+def prompt_mode_config():
+    """Prompt mode settings, fail-open to passthrough on any read error."""
+    try:
+        cfg = wb_settings.prompt_config(ACCOUNTS_DIR)
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {"mode": "passthrough", "file": ""}
+    return cfg
+
+
+def apply_prompt_mode(messages):
+    """Apply the configured prompt mode to one request's messages.
+
+    passthrough is the legacy behaviour (client system prompts ride through);
+    custom/append are opt-in. While the degrade window is active, passthrough
+    and append switch to the minimal neutral prompt; custom never degrades.
+    An unreadable prompt file fails open to passthrough rather than blocking.
+    """
+    cfg = prompt_mode_config()
+    mode = cfg.get("mode") or "passthrough"
+    degraded = PROMPT_DEGRADE.active()
+    if mode in ("custom", "append"):
+        try:
+            text = wb_prompt.load_prompt(mode, cfg.get("file"))
+        except Exception:
+            text = ""
+        if text:
+            return wb_prompt.apply_mode(messages, mode, text, degraded=degraded)
+        return messages
+    if degraded:
+        return wb_prompt.apply_mode(messages, mode, "", degraded=True)
+    return messages
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Resolve the effective thinking state before the backfill below: while
@@ -3694,6 +4056,9 @@ def build_upstream_body(payload):
         elif thinking_type != "disabled" and str(effort or "").strip().lower() != "none":
             thinking_enabled = True
     messages = normalize_roles(payload.get("messages") or [])
+    # Prompt mode runs before sanitize/backfill so the gateway prompt is the
+    # one the upstream sees, with the client's fingerprint-y system text gone.
+    messages = apply_prompt_mode(messages)
     messages = sanitize_messages(messages)
     messages = backfill_reasoning_content(
         messages, model, thinking_enabled=thinking_enabled
@@ -3718,9 +4083,12 @@ def build_upstream_body(payload):
     body["model"] = model
     body["messages"] = messages
     # Repair tool-call pairing before the body leaves: a call whose result never
-    # came back, or results split from their batch by an interleaved message,
-    # makes the upstream reject every later turn of that conversation.
-    repaired, _repacked = repack_tool_result_blocks(body["messages"])
+    # came back, results split from their batch by an interleaved message, or a
+    # parallel batch split into adjacent assistant messages makes the upstream
+    # reject every later turn of that conversation. Order matters: merge the
+    # split declarations first, so repack sees one complete batch.
+    repaired, _merged = merge_adjacent_tool_calls(body["messages"])
+    repaired, _repacked = repack_tool_result_blocks(repaired)
     repaired, _cleaned = cleanup_orphan_tool_calls(repaired)
     body["messages"] = repaired
     translate_max_completion_tokens(body)
@@ -3895,6 +4263,59 @@ class RateLimited(Exception):
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
+def gateway_hint(status, message):
+    """A gateway-side note that sits beside the raw upstream message.
+
+    The hint never replaces the upstream wording (clients keep parsing the
+    same envelope); it only explains what the gateway could classify, so a
+    user staring at "400 Bad Request" learns whether the fix is a smaller
+    context, a different model, a re-login or simply waiting. An empty string
+    means "nothing to add" - no hint is invented for unknown failures.
+
+    Covers the shapes the hub can classify from the upstream body/status:
+    11133 model_param_invalid, 11135 invalid_image_data, rate limits, content
+    review, exhausted credits, dead sessions, missing models, prompt-length
+    rejections, WAF blocks and the local no-usable-account case.
+    """
+    text = str(message or "")
+    lower = text.lower()
+    if status == 503 and "concurrent chat limit" in lower:
+        return "gateway is busy at its concurrency limit; retry shortly"
+    if ("11133" in lower or "model_param_invalid" in lower
+            or "invalid request parameters" in lower):
+        return ("request parameters were rejected by the model provider; "
+                "check message format and model capabilities")
+    if ("11135" in lower or "invalid_image_data" in lower
+            or "replace the image" in lower):
+        return ("image data rejected by upstream; use a real/valid image, "
+                "may need a new conversation")
+    if "no usable account" in lower or "no healthy account" in lower:
+        return "no healthy account available in pool; check /status or retry later"
+    if ("context length" in lower or "context_length" in lower
+            or "prompt too long" in lower or "too many tokens" in lower
+            or "maximum context" in lower):
+        return ("request context exceeds the model's limit; reduce "
+                "history/message size")
+    if status == 429 or "rate limit" in lower or "frequency limit" in lower:
+        return "rate limited by upstream; retry after reset"
+    if status == 402 or ("insufficient" in lower and "credit" in lower):
+        return ("account credits exhausted at upstream; waiting for daily "
+                "check-in to restore")
+    if "session" in lower and ("not found" in lower or "expired" in lower):
+        return ("account session expired at upstream; the account is disabled "
+                "until re-login")
+    if "content" in lower and ("reject" in lower or "policy" in lower):
+        return ("request content was rejected by content policy; adjust the "
+                "prompt and retry")
+    if ("no such model" in lower or "model not found" in lower
+            or "unsupported model" in lower):
+        return ("upstream has no such model on this backend; switch model or "
+                "retry on another account")
+    if status == 403 and "waf" in lower:
+        return "upstream WAF blocked the gateway; retry after the block window"
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 出站身分自動切換
 #
@@ -4019,6 +4440,17 @@ def is_transient(exc):
     return any(m in t for m in markers)
 
 
+def rate_limit_is_account_level(detail, reset_at):
+    """True when a 429 is a soft account limit rather than a model park.
+
+    The upstream names a reset wall clock for the model-scoped form (code
+    6004, "usage exceeds frequency limit"). A 429 without one is a soft
+    limit on the credential, which gets an exponential account cooldown
+    instead of parking just one model.
+    """
+    return reset_at is None
+
+
 def parse_rate_limit_reset(detail):
     """Pull the reset time out of an upstream 429 body, if it names one.
 
@@ -4126,6 +4558,7 @@ def open_upstream(payload, session_key=None, target_realm=None):
     last_429_detail = ""
     last_403_detail = ""
     transient_hits = 0
+    degraded_retried = False
     # Read once per request, not per attempt: this is a panel setting, and a
     # settings read on every retry would be pure overhead.
     auto_switch = auto_switch_product_enabled()
@@ -4163,7 +4596,7 @@ def open_upstream(payload, session_key=None, target_realm=None):
             resp = wb_accounts.urlopen(req, timeout=header_timeout,
                                        proxy=account.proxy)
             _apply_stream_idle_timeout(resp, idle_timeout)
-            account.clear_error(model=model)
+            account.note_success(model=model)
             reset_switch_counter(account, model)
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
@@ -4176,6 +4609,16 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 except Exception:
                     detail = ""
                 reset_at = parse_rate_limit_reset(detail)
+                if rate_limit_is_account_level(detail, reset_at):
+                    wait = account.note_soft_rate("HTTP 429 (account soft rate)")
+                    log("account %s soft-rate limited, cooling %.0fs (streak %d)"
+                        % (account.uid[:8], wait, account.soft_streak))
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    last_error = exc
+                    last_429 = exc
+                    last_429_detail = detail
+                    continue
                 wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
                 # Model-scoped: only this model is throttled for this account,
                 # so sibling models stay serviceable on the same credential.
@@ -4205,12 +4648,36 @@ def open_upstream(payload, session_key=None, target_realm=None):
                     detail = exc.read(400).decode("utf-8", "replace")
                 except Exception:
                     detail = ""
+                # Panel degrade.go: a content rejection in passthrough/append
+                # mode is usually a system-prompt fingerprint false positive.
+                # Switch to the minimal neutral prompt until next 00:00 CST
+                # and retry this turn once; custom mode opted out.
+                if (not degraded_retried
+                        and prompt_mode_config().get("mode") in ("passthrough", "append")):
+                    PROMPT_DEGRADE.trigger()
+                    degraded_retried = True
+                    upstream_body = build_upstream_body(payload)
+                    tried.discard(account.uid)
+                    log("upstream 403 (content review) -> degraded prompt retry")
+                    continue
                 log("upstream 403 for '%s' (content review), passing through" % model)
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 last_error = exc
                 last_403_detail = detail
                 break
+            if exc.code == 402:
+                try:
+                    detail = exc.read(400).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
+                account.note_balance_cooled(detail or "HTTP 402 (insufficient credits)")
+                log("account %s out of credits (402), parked until 04:00"
+                    % account.uid[:8])
+                if session_key and POOL:
+                    POOL.affinity.unbind(session_key)
+                last_error = exc
+                continue
             if exc.code == 401:
                 log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
                 if session_key and POOL:
@@ -4222,7 +4689,9 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 continue
             if exc.code in (500, 502, 503, 504):
                 transient_hits += 1
-                log("upstream %s for '%s', retrying" % (exc.code, model))
+                account.note_failure("HTTP %d" % exc.code)
+                log("upstream %s for '%s', retrying (fails=%d)"
+                    % (exc.code, model, account.fails))
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 last_error = exc
@@ -4233,11 +4702,13 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 POOL.affinity.unbind(session_key)
             if is_transient(exc):
                 transient_hits += 1
-                log("upstream connection hiccup for '%s' (%s), retrying"
-                    % (model, type(exc).__name__))
+                account.note_unknown_failure("connection: %s" % type(exc).__name__)
+                log("upstream connection hiccup for '%s' (%s), retrying (degrade=%d)"
+                    % (model, type(exc).__name__, account.degrade_count))
                 last_error = exc
                 time.sleep(min(0.6 * transient_hits, 2.0))
                 continue
+            account.note_unknown_failure(str(exc)[:120])
             account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1))
             last_error = exc
             continue
@@ -4315,9 +4786,12 @@ def aggregate_stream(raw_iter, model, resp_id):
     usage = None
     started = time.time()
     first_chunk_at = None
+    saw_done = False
     for line in raw_iter:
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
+            if data == "[DONE]":
+                saw_done = True
             continue
         try:
             chunk = json.loads(data)
@@ -4399,6 +4873,15 @@ def aggregate_stream(raw_iter, model, resp_id):
             k: v for k, v in tool_calls_map.items()
             if (v.get("function") or {}).get("name")
         }
+    # A stream cut off by max_tokens / a dropped connection leaves the last
+    # tool call with half-written JSON. Drop those calls instead of handing
+    # the client unparsable arguments; only non-empty unparsable strings
+    # count as truncated, so no-argument tools survive.
+    if tool_calls_map and (finish == "length" or not saw_done):
+        tool_calls_map = {
+            k: v for k, v in tool_calls_map.items()
+            if not is_truncated_arguments((v.get("function") or {}).get("arguments"))
+        }
     if tool_calls_map:
         ordered_tcs = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
         message["tool_calls"] = ordered_tcs
@@ -4428,6 +4911,7 @@ def aggregate_stream(raw_iter, model, resp_id):
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
+        normalize_usage_cache_aliases(usage)
         out["usage"] = usage
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
@@ -5990,6 +6474,7 @@ def stream_responses_events(upstream, model, holder):
     tool_calls_map = {}
     text_buffer = ""
     dsml_tool_calls = []
+    saw_done = False
     custom_names = set(holder.get("custom_names") or ())
     ns_map = holder.get("namespace_map") or {}
     # 由反代代跑的網路工具呼叫，收集起來不轉發給客戶端
@@ -6251,7 +6736,8 @@ def stream_responses_events(upstream, model, holder):
                     "prompt_tokens_details": {"cached_tokens": 0},
                 }
                 holder["usage"] = usage
-        status = "completed" if finish != "length" else "incomplete"
+        status = ("completed" if (finish != "length" and not dropped_truncated)
+                  else "incomplete")
         final = resp_obj(status)
         if finish == "length":
             final["incomplete_details"] = {"reason": "max_output_tokens"}
@@ -6266,6 +6752,8 @@ def stream_responses_events(upstream, model, holder):
     for raw in upstream:
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
+            if data == "[DONE]":
+                saw_done = True
             continue
         try:
             chunk = json.loads(data)
@@ -6451,6 +6939,18 @@ def stream_responses_events(upstream, model, holder):
                             break
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+    # Truncated streams (max_tokens, dropped connection) can leave tool-call
+    # arguments as half-written JSON. Do not close those calls out as
+    # completed: drop them before finalize so the client never receives a
+    # function_call_arguments.done / output_item.done with unparsable
+    # arguments. Complete calls in the same batch are kept.
+    dropped_truncated = 0
+    if tool_calls_map and (finish == "length" or not saw_done):
+        for idx in sorted(tool_calls_map.keys()):
+            entry = tool_calls_map[idx]
+            if is_truncated_arguments(entry.get("arguments")):
+                tool_calls_map.pop(idx, None)
+                dropped_truncated += 1
     yield from _finalize()
 
 # ---------------------------------------------------------------------------
@@ -6528,7 +7028,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.6.15"
+    server_version = "wb-proxy/1.6.16"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -6693,7 +7193,11 @@ class Handler(BaseHTTPRequestHandler):
         # the drain below waits for data that will never arrive.
         self._handle_expect_continue()
         self._discard_body()
-        self._json(code, {"error": {"message": message, "type": err_type, "code": code}})
+        error = {"message": message, "type": err_type, "code": code}
+        hint = gateway_hint(code, message)
+        if hint:
+            error["gateway_hint"] = hint
+        self._json(code, {"error": error})
     def _anthropic_error(self, code, message, err_type=None):
         """Reply with the Anthropic JSON error envelope, not OpenAI's."""
         self._handle_expect_continue()
@@ -7021,6 +7525,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_usage_by_account()
         if path == "/usage/perf":
             return self._get_usage_perf(query)
+        if path == "/usage/timeseries":
+            return self._get_usage_timeseries(query)
         if path == "/tasks":
             return self._get_tasks(query)
         if path == "/scheduler":
@@ -7094,6 +7600,12 @@ class Handler(BaseHTTPRequestHandler):
             entries = fetch_models(realm=req_realm)
         except Exception as exc:
             return self._error(502, str(exc))
+        # Level 4 is best effort: warm the local cache in the background at
+        # most once per cooldown; offline deployments just keep the fallback.
+        try:
+            wb_modelsdev.refresh_async(ACCOUNTS_DIR, log=log)
+        except Exception:
+            pass
         data = [model_entry(mid, meta) for mid, meta in entries]
         # A key restricted to specific models must only discover those, or a
         # client's model picker advertises models every call would then reject.
@@ -7239,6 +7751,21 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         return self._json(200, {"accounts": usage_by_account()})
+
+    def _get_usage_timeseries(self, query):
+        if not self._authorized():
+            return
+        req_realm = (query.get('realm', [None])[0]
+                     or self.headers.get('X-Realm') or CURRENT_REALM)
+        req_range, req_since, req_until = range_query(query)
+        bucket = (query.get("bucket") or [None])[0]
+        try:
+            bucket_seconds = int(bucket) if bucket else None
+        except (TypeError, ValueError):
+            bucket_seconds = None
+        return self._json(200, usage_timeseries(
+            realm=req_realm, range=req_range, since=req_since,
+            until=req_until, bucket_seconds=bucket_seconds))
 
     def _get_usage_perf(self, query):
         if not self._authorized():
@@ -7718,6 +8245,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
             reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+        if "prompt" in payload:
+            raw = payload.get("prompt")
+            if not isinstance(raw, dict):
+                return self._error(400, "prompt must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_prompt_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_prompt_config(ACCOUNTS_DIR, patch)
+            reply["prompt"] = wb_settings.prompt_config(ACCOUNTS_DIR)
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -7906,6 +8444,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_import_desktop(payload)
         if path == "/accounts/refresh":
             return self._route_accounts_refresh(payload)
+        if path == "/accounts/sync-profile":
+            return self._route_accounts_sync_profile(payload)
         if path == "/accounts/test":
             return self._route_accounts_test(payload)
         if path == "/accounts/set":
@@ -8297,6 +8837,39 @@ class Handler(BaseHTTPRequestHandler):
             account.save(ACCOUNTS_DIR)
             results.append({"uid": account.uid, "ok": ok, "error": account.last_error})
         return self._json(200, {"results": results})
+
+    def _route_accounts_sync_profile(self, payload):
+        """Manual nickname refresh from the web console.
+
+        Opt-in by nature: only runs when the operator asks for it. The
+        upstream response carries phone numbers and other personal fields;
+        wb_accounts.fetch_account_profile parses only uid/nickname.
+        """
+        uid = str(payload.get("uid") or "").strip()
+        realm = payload.get("realm")
+        if uid:
+            targets = [POOL.get(uid)]
+        elif realm and realm != "all":
+            targets = [a for a in POOL.accounts if a.realm == realm]
+        else:
+            targets = list(POOL.accounts)
+        updated = []
+        failed = []
+        for account in targets:
+            if account is None:
+                continue
+            try:
+                nickname = account.sync_nickname()
+            except Exception as exc:
+                failed.append({"uid": account.uid, "error": str(exc)[:200]})
+                log("profile sync failed for %s: %s" % (account.uid[:8], exc),
+                    level="WARN")
+                continue
+            updated.append({"uid": account.uid, "nickname": nickname})
+            log("account %s: nickname synced from the web console"
+                % account.uid[:8], level="INFO")
+        return self._json(200, {"updated": updated, "failed": failed,
+                                "accounts": account_views()})
 
     def _route_accounts_test(self, payload):
         uid = payload.get("uid")
@@ -9264,6 +9837,10 @@ def _bootstrap_runtime(args):
     POOL.load()
     POOL.apply_proxy_slots()
     POOL.apply_reserve_credits()
+    # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
+    # just loaded. Runs before the listener exists, so no request can hold a
+    # slot yet and the semaphore swap is safe.
+    resize_chat_slots(POOL.count_ready())
     apply_daily_token_limit()
     apply_daily_credit_limit()
     apply_model_daily_token_limit()

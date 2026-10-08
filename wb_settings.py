@@ -78,6 +78,24 @@ def save(accounts_dir, data):
         return path
 
 
+def deep_merge(base, patch):
+    """Recursively merge patch into base; unknown sibling keys survive.
+
+    The panel form only submits the keys it manages. Replacing a whole group
+    would silently drop hand-written or future keys, so nested objects merge
+    key by key. Returns a new dict; the inputs are not mutated.
+    """
+    if not isinstance(base, dict) or not isinstance(patch, dict):
+        return patch
+    out = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def panel_password_is_default(accounts_dir):
     data = load(accounts_dir)
     if not data.get("panel_password_hash"):
@@ -882,7 +900,62 @@ def set_upstream_config(accounts_dir, cfg):
     clean = validate_upstream_patch(current)
     with _lock:
         data = load(accounts_dir)
-        data["upstream"] = clean
+        data["upstream"] = deep_merge(data.get("upstream"), clean)
+        save(accounts_dir, data)
+    return clean
+
+
+PROMPT_DEFAULTS = {
+    "mode": "passthrough",
+    "file": "",
+}
+
+
+def validate_prompt_patch(raw):
+    """Strict validation for a panel-saved prompt patch."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key == "mode":
+            if not isinstance(value, str):
+                raise ValueError("prompt mode must be a string")
+            mode = value.strip().lower()
+            if mode not in ("passthrough", "custom", "append"):
+                raise ValueError("prompt mode must be passthrough, custom or append")
+            out["mode"] = mode
+        elif key == "file":
+            if not isinstance(value, str):
+                raise ValueError("prompt file must be a string")
+            out["file"] = value.strip()
+        else:
+            raise ValueError("unknown prompt setting %r" % key)
+    return out
+
+
+def prompt_config(accounts_dir):
+    """Gateway system-prompt mode (default passthrough = legacy behaviour)."""
+    stored = load(accounts_dir).get("prompt")
+    stored = stored if isinstance(stored, dict) else {}
+    mode = stored.get("mode", PROMPT_DEFAULTS["mode"])
+    if not isinstance(mode, str) or mode.strip().lower() not in (
+            "passthrough", "custom", "append"):
+        mode = PROMPT_DEFAULTS["mode"]
+    else:
+        mode = mode.strip().lower()
+    file_path = stored.get("file", PROMPT_DEFAULTS["file"])
+    if not isinstance(file_path, str):
+        file_path = PROMPT_DEFAULTS["file"]
+    return {"mode": mode, "file": file_path.strip()}
+
+
+def set_prompt_config(accounts_dir, cfg):
+    """Persist the prompt settings. Returns the stored config."""
+    current = prompt_config(accounts_dir)
+    if isinstance(cfg, dict):
+        current.update({k: v for k, v in cfg.items() if k in PROMPT_DEFAULTS})
+    clean = validate_prompt_patch(current)
+    with _lock:
+        data = load(accounts_dir)
+        data["prompt"] = clean
         save(accounts_dir, data)
     return clean
 

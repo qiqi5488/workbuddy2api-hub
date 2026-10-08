@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.6.15-2496ED?style=flat-square" alt="Version 1.6.15"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.6.16-2496ED?style=flat-square" alt="Version 1.6.16"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -160,6 +160,9 @@ docker run -d --name wb-proxy-watchtower --restart unless-stopped \
   `docker compose logs wb-proxy | grep -i "api key"`。
 - **报错 `pull access denied ... repository does not exist`**：镜像名若省略了 Registry 地址（如写成了 `ardeyouxipianyi/workbuddy2api-hub`），Docker 默认访问 Docker Hub。若遇网络受阻，请确保镜像名补全为 `ghcr.io/ardeyouxipianyi/workbuddy2api-hub:latest`；GHCR 包是公开的，拉取无需登录。
 
+- **目录权限（PUID/PGID）**：容器默认以 root（`0:0`）运行，与历史行为一致。想以宿主用户身份跑，就在 compose 里设 `PUID=$(id -u)` / `PGID=$(id -g)`（或写进 `.env`），并确保 `./accounts`、`./usage` 对该 uid 可写；`docker run` 也可直接加 `--user $(id -u):$(id -g)`。
+- **健康检查**：镜像自带 `HEALTHCHECK`（每 30s 请求一次 `/health`），`docker ps` 的 STATUS 列会显示 healthy/unhealthy，编排器也可直接探活。
+
 ### 6. 测试
 
 全部测试集中在 `tests/`，一条命令跑完：
@@ -170,7 +173,8 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
-- CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12。
+- 58 个套件：44 个 Python + 14 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12。推送 `v*` tag 时额外断言 **tag == 源码版本**（`wb_proxy.py` 里的两处版本串必须先一致，`-ci` 演练 tag 豁免）。
 
 ---
 
@@ -328,7 +332,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 「数据指标看板」页顶部可切换统计口径：**今日 / 本周 / 本月 / 全部历史 / 自定义**。本周自周一零点起算、本月自 1 号零点起算，自定义可指定起止时间（任一侧留空表示不限）。切换后 KPI 卡片、账号用量透视表与模型性能表会一起切到同一窗口。
 
-「设置」页左侧为区块导航：导航项由页面上实际存在的设置区块现场生成（不写死清单，增删区块无需改代码），点击即可直达对应区块，滚动时自动高亮当前区块；点击后地址栏会带上 `#锚点`，便于分享链接或刷新后回到同一位置。窄屏下自动收成可横向滑动的吸顶标签条。
+每个主页面（「账号网关」「数据指标看板」「网关设置」）左侧都有一条区块导航：导航项由页面上实际存在的区块现场生成（不写死页面、也不写死清单，增删区块甚至新增页面都无需改导航代码），点击即可直达对应区块，滚动时自动高亮当前区块；点击后地址栏会带上 `#锚点`，便于分享链接或刷新后回到同一位置。被隐藏的区块不进导航，也不能作为锚点落点；区块不足两项的页面（例如只有一个视图的运行日志页）不显示侧栏。窄屏下侧栏自动收成可横向滑动的吸顶标签条。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -350,6 +354,45 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 ---
 
 ## 六、版本更新记录 (Changelog)
+
+### v1.6.16
+
+重大稳定性与观测治理版本：涵盖账号熔断降权、工具调用防拆分修复、时序图表、全页面导航及多项深度优化：
+
+- **上游工具调用配对修复**（[PR #153](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/153)，感谢 [@Cekxri](https://github.com/Cekxri)）：自动合并被部分客户端拆散的连续 assistant tool_calls 批次并丢弃截断参数，根治 DeepSeek 报 400 失败；
+- **账号级软限流指数退避、熔断与降权治理**（[PR #163](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/163)，感谢 [@Cekxri](https://github.com/Cekxri)）：账号连续失败时自动指数退避，连续硬错误熔断，有效保护账号不被频繁失败打挂；
+- **402 余额不足账号精准冷却至次日 04:00**（[PR #157](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/157)，感谢 [@Cekxri](https://github.com/Cekxri)）：余额用尽账号避免频繁重试，支持余额恢复后实时提前解冻；
+- **面板新增 Token 时序图与积分扣减历史**（[PR #161](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/161)，感谢 [@Cekxri](https://github.com/Cekxri)）：新增 `/usage/timeseries` 时序聚合接口与看板可视化走势图；
+- **侧栏区块导航推广至所有主页面**（[PR #169](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/169)，感谢 [@LeoK77S](https://github.com/LeoK77S)）：通用化侧边栏组件，网关运维与数据指标页均支持左侧吸顶导航与滚动高亮；
+- **系统提示词模式注入与 403 重试**（[PR #160](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/160)，感谢 [@Cekxri](https://github.com/Cekxri)）：支持 passthrough/custom/append 三种系统提示词模式；
+- **缓存命中别名归一化**（[PR #164](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/164)，感谢 [@Cekxri](https://github.com/Cekxri)）：消除别名遮蔽，客户端始终读取统一的真实缓存命中数；
+- **错误信封新增 gateway_hint 归因解释**（[PR #154](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/154)，感谢 [@Cekxri](https://github.com/Cekxri)）；
+- **面板一键同步账号昵称**（[PR #158](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/158)，感谢 [@Cekxri](https://github.com/Cekxri)）；
+- **会话亲和历史长度上限与号池弹性并发**（[PR #152](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/152)，感谢 [@ddddd-ren](https://github.com/ddddd-ren)）；
+- **四级模型上下文/输出查找链与输出上限探针**（[PR #165](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/165)、[PR #166](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/166)，感谢 [@Cekxri](https://github.com/Cekxri)）；
+- **看板 UI 深度打磨**：最近请求表格表头与数据全列居中对齐、模型与推理强度拆分为独立列、KPI 卡片双币种优雅对齐。
+
+
+### 未发布
+
+两项与「大请求 + 号池规模」相关的可调限制，默认行为不变：
+
+- **会话亲和加长度上限（`WB_AFFINITY_MAX_MSGS`，默认 400）**：前缀亲和把整段对话钉在同一个账号上以吃满上游的账号级 prompt cache，但对话上下文是单调增长的，于是那个账号要反复接收越来越大的请求体。实测某生产实例（wk4，333 个请求）请求体与上游断连率的关系：
+
+  | 消息条数 | 请求数 | 断连率 |
+  |---|---|---|
+  | < 150 | 82 | 0.0% |
+  | 150–300 | 59 | 3.4% |
+  | 300–400 | 64 | 7.8% |
+  | 400–500 | 50 | 10.0% |
+
+  断连（`TimeoutError` / `RemoteDisconnected`）触发重试，把 8.8s 的请求拖到 11.6s，首字延迟随之翻倍。超过上限的对话不再绑定账号，重新参与轮询：代价是丢掉前缀缓存，收益是断连与重试消失。设 `0` 关闭该上限，恢复原有行为。阈值不宜调低——同一实例 94% 的请求靠亲和拿到 98.5% 的缓存命中率。
+
+- **聊天并发上限可按号池规模自动取值（`WB_MAX_CONCURRENT_CHAT=auto`）**：原先是固定 32，与号池里有几个账号无关，5 个账号和 200 个账号的部署共用同一个值。设为 `auto` 后取「就绪账号数」，且不低于 32。仅扩容、不缩容：已在飞行的请求持有旧信号量的许可，缩容会让归还次数超过上限并触发 `BoundedSemaphore` 的 `ValueError`。默认仍是固定值 32，行为不变。
+
+- 新增 `tests/_test_affinity_length_cap.py`（13 项）：钉住阈值边界（`msgs == cap` 仍绑定、`cap + 1` 释放）、`0` 关闭上限、长对话的键稳定性、不同对话不碰撞、`None` / 空列表安全，以及并发上限的按池取值、下限回落、只增不减、固定值下为空操作、脏输入忽略与扩容后的许可计数。
+
+- **修复 `tests/run_all.py` 在非 UTF-8 控制台下崩溃**（Windows CI 长期红灯的根因）：各套件本身以 `PYTHONIOENCODING=utf-8` 运行、输出也按 utf-8 从日志读回，但 `run_all.py` **自己**再打印这行摘要时用的是控制台编码。Windows runner 的 stdout 是 cp1252，于是第一条含中文的摘要就抛 `UnicodeEncodeError` —— 而这时所有套件其实**已经全部通过**，是汇总环节把整轮判成了失败。main 上连续多个版本（含 v1.6.15 自身）的 Windows job 都是这么挂的。现在启动时把本进程的 stdout/stderr 重设为 utf-8，并以 `errors="replace"` 兜底（生僻码位退化成 `?` 而不是终止整轮）。新增 `tests/_test_run_all_encoding.py`（3 项）：分别在 cp1252 与 utf-8 下跑一个含中文摘要的套件，断言退出码为 0、输出里没有 `UnicodeEncodeError`，并确认摘要确实来自被选中的那个套件。
 
 ### v1.6.15
 

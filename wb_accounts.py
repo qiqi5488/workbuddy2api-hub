@@ -34,7 +34,9 @@ import wb_webagent
 # 打卡在桌面端对话之外，再走一次这条网页通道，并且把它跑到 completed。
 # ---------------------------------------------------------------------------
 WEB_ORIGIN = "https://www.workbuddy.ai"
+WEB_ORIGIN_CN = "https://www.workbuddy.cn"
 WEB_CONVERSATIONS_URL = WEB_ORIGIN + "/console/as/conversations/"
+PROFILE_PATH = "/console/account"
 WEB_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0")
 DAILY_CHAT_MODEL = "deepseek-v4.1-flash"
@@ -54,6 +56,42 @@ def _retryable(exc):
     if isinstance(exc, (TimeoutError, ConnectionResetError, ConnectionAbortedError, OSError)):
         return True
     return False
+
+
+def web_origin_for(realm):
+    """Web-console origin per realm (CN vs international)."""
+    return WEB_ORIGIN_CN if str(realm or "").lower() == "cn" else WEB_ORIGIN
+
+
+def fetch_account_profile(account, timeout=15):
+    """Web-console account profile -> (uid, nickname), nothing else.
+
+    The endpoint also returns phoneNumber and other personal fields; this
+    function parses only uid and nickname, so sensitive values never enter
+    logs, responses or storage. A uid mismatch against the credential raises
+    (wrong-account guard).
+    """
+    origin = web_origin_for(getattr(account, "realm", ""))
+    req = urllib.request.Request(
+        origin + PROFILE_PATH, method="GET",
+        headers={
+            "Authorization": "Bearer " + str(account.access_token or ""),
+            "Accept": "application/json, text/plain, */*",
+            "x-client-platform": "web",
+            "Origin": WEB_ORIGIN_CN,
+            "Referer": WEB_ORIGIN_CN + "/profile/account-settings",
+            "User-Agent": WEB_USER_AGENT,
+        },
+    )
+    with urlopen(req, timeout=timeout, proxy=getattr(account, "proxy", "")) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("profile response is not an object")
+    uid = str(data.get("uid") or "")
+    if uid and account.uid and uid != account.uid:
+        raise RuntimeError("profile uid mismatch")
+    nickname = data.get("nickname")
+    return uid, nickname.strip() if isinstance(nickname, str) else ""
 
 
 _OPENER_CACHE = {}
@@ -289,6 +327,59 @@ def resolve_device_token(accounts_dir):
     return token
 
 
+def next_local_4am(now=None):
+    """Epoch of the next local 04:00.
+
+    The daily reset that puts CN credits back happens overnight, so the
+    04:00 wall is what an out-of-credits park waits for. A timestamp already
+    past 04:00 rolls to tomorrow, so a deadline is never reused in place.
+    """
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    stamp = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                         4, 0, 0, 0, 0, -1))
+    if stamp <= now:
+        stamp += 86400
+    return stamp
+
+
+# Account-level failure governance. A repeatedly soft-limited credential
+# backs off exponentially instead of being retried on every request; a
+# credential that keeps failing hard trips a breaker; unknown failures degrade
+# it for a while. The counters live on Account, these helpers only turn a
+# count into seconds (panel project's pool semantics).
+SOFT_RATE_BASE = 600.0          # first account-level 429: 10 minutes
+SOFT_RATE_MAX = 7200.0          # ... doubling up to 2 hours
+BREAKER_THRESHOLD = 3           # consecutive hard failures before the breaker
+BREAKER_COOLDOWN = 1800.0       # first breaker window: 30 minutes
+BREAKER_COOLDOWN_MAX = 21600.0  # ... doubling up to 6 hours
+DEGRADE_THRESHOLD = 5           # consecutive unknown failures before degrading
+DEGRADE_COOLDOWN = 600.0        # first degrade window: 10 minutes
+DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
+
+
+def _exponential_backoff(count, base, cap, offset):
+    """base * 2 ** (count - offset), clamped to cap and to 20 steps."""
+    step = max(0, int(count) - int(offset))
+    return min(float(base) * (2 ** min(step, 20)), float(cap))
+
+
+def soft_backoff(streak):
+    """Cooldown seconds for `streak` consecutive account-level soft limits."""
+    return _exponential_backoff(streak, SOFT_RATE_BASE, SOFT_RATE_MAX, 1)
+
+
+def breaker_backoff(fails):
+    """Breaker cooldown for `fails` consecutive hard failures."""
+    return _exponential_backoff(fails, BREAKER_COOLDOWN, BREAKER_COOLDOWN_MAX,
+                                BREAKER_THRESHOLD)
+
+
+def degrade_backoff(fails):
+    """Degrade window for `fails` consecutive unknown failures."""
+    return _exponential_backoff(fails, DEGRADE_COOLDOWN, DEGRADE_COOLDOWN_MAX,
+                                DEGRADE_THRESHOLD)
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
@@ -353,6 +444,19 @@ class Account(object):
         # otherwise a single throttled model blackholes every request on the pool.
         # Deliberately runtime-only (not persisted): see VOLATILE_FIELDS.
         self.model_cooldowns = {}
+# 402 (out of credits): a hard park until the next local 04:00,
+        # instead of a short cooldown that would retry an empty account all
+        # day. Runtime-only, like the other throttle windows; a balance
+        # refresh that shows credits again lifts it early.
+        self.balance_until = 0.0
+# Account-level failure streaks; see the *_backoff() helpers above.
+        # All runtime-only, like the other throttle windows: a restart clears
+        # them and the account gets a clean slate.
+        self.soft_streak = 0
+        self.fails = 0
+        self.degrade_count = 0
+        self.breaker_until = 0.0
+        self.degrade_until = 0.0
         self.credits = data.get("credits") or None
         self.last_checkin = data.get("lastCheckin") or None
         self.last_daily_chat = data.get("lastDailyChat") or None
@@ -435,7 +539,7 @@ class Account(object):
         with self._throttle_lock:
             error = self.last_error
             detail = self.last_error_detail
-            deadline = self.cooldown_until
+            deadline = max(self.cooldown_until, self.balance_until, self.breaker_until, self.degrade_until)
             active = [(model, until) for model, until in self.model_cooldowns.items()
                       if until > now]
         active.sort(key=lambda pair: (pair[1], pair[0]))
@@ -470,6 +574,9 @@ class Account(object):
             "inCooldown": deadline > now,
             "cooldownFor": round(max(0.0, deadline - now)) or None,
             "modelCooldowns": models,
+            "softStreak": int(self.soft_streak),
+            "breakerFor": round(max(0.0, self.breaker_until - now)) or None,
+            "degradeFor": round(max(0.0, self.degrade_until - now)) or None,
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
@@ -755,6 +862,22 @@ class Account(object):
         if not directory:
             return ""
         return resolve_device_token(directory)
+
+    def sync_nickname(self):
+        """Manual web-console nickname refresh.
+
+        Only called from the explicit dashboard/API action - never from the
+        balance scheduler - and persists the new nickname immediately.
+        """
+        _uid, nickname = fetch_account_profile(self)
+        if nickname and nickname != self.nickname:
+            self.nickname = nickname
+            directory = getattr(self, "accounts_dir", "")
+            if not directory and self.path:
+                directory = os.path.dirname(self.path)
+            if directory:
+                self.save(directory)
+        return nickname
 
     def set_product(self, value):
         """切換出站身分（cli <-> workbuddy）。回傳 True 表示真的換了。
@@ -1394,6 +1517,14 @@ class Account(object):
         return {"ok": True, "credits": self.credits}
 
     def fetch_credits(self):
+        """Refresh the balance; a refresh that shows credits again also lifts
+        an early 402 park (revive_balance_cooldown)."""
+        res = self._fetch_credits_raw()
+        if isinstance(res, dict) and res.get("ok"):
+            self.revive_balance_cooldown()
+        return res
+
+    def _fetch_credits_raw(self):
         if self.realm == "cn":
             try:
                 res = self._fetch_credits_cn_detailed()
@@ -1439,13 +1570,98 @@ class Account(object):
             actual_cooldown = 3 if single_account else cooldown
             self.cooldown_until = time.time() + actual_cooldown
 
+    def note_balance_cooled(self, message="insufficient credits"):
+        """402 / out of credits: park until the next local 04:00.
+
+        A short cooldown would hand the empty account out again minutes
+        later, and every request to it fails the same way; the daily reset
+        is when credits come back, so that is the wall clock this waits for.
+        A refresh that shows credits again can lift it early - see
+        revive_balance_cooldown().
+        """
+        until = next_local_4am()
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+            self.balance_until = max(self.balance_until, until)
+        return until
+
+    def revive_balance_cooldown(self):
+        """A balance refresh that shows credits again lifts the 402 park only.
+
+        Rate-limit and model cooldowns stay exactly as they are; this is not
+        a general clear_error().
+        """
+        if not self.balance_until:
+            return False
+        credits = self.credits if isinstance(self.credits, dict) else {}
+        try:
+            remain = int(credits.get("remain"))
+        except (TypeError, ValueError):
+            remain = None
+        if remain is None or remain <= 0:
+            return False
+        with self._throttle_lock:
+            self.balance_until = 0.0
+            self.last_error = ""
+            self.last_error_detail = ""
+        return True
+
+    def note_soft_rate(self, message):
+        """Account-level rate limit: soft cooldown with exponential backoff."""
+        with self._throttle_lock:
+            self.soft_streak += 1
+            wait = soft_backoff(self.soft_streak)
+            self.last_error = str(message)[:200]
+            self.cooldown_until = max(self.cooldown_until, time.time() + wait)
+        return wait
+
+    def note_failure(self, message):
+        """5xx / transport failure: feed the breaker counter."""
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+            self.fails += 1
+            if self.fails >= BREAKER_THRESHOLD:
+                wait = breaker_backoff(self.fails)
+                self.breaker_until = max(self.breaker_until, time.time() + wait)
+        return self.breaker_until
+
+    def note_unknown_failure(self, message):
+        """Unknown error: degrade counter plus the shared breaker counter."""
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+            self.degrade_count += 1
+            self.fails += 1
+            now = time.time()
+            if self.degrade_count >= DEGRADE_THRESHOLD:
+                wait = degrade_backoff(self.degrade_count)
+                self.degrade_until = max(self.degrade_until, now + wait)
+            if self.fails >= BREAKER_THRESHOLD:
+                wait = breaker_backoff(self.fails)
+                self.breaker_until = max(self.breaker_until, now + wait)
+        return self.degrade_until
+
+    def note_success(self, model=None):
+        """A served request clears every account-level penalty."""
+        with self._throttle_lock:
+            if model:
+                self.model_cooldowns.pop(model, None)
+            self.soft_streak = 0
+            self.fails = 0
+            self.degrade_count = 0
+            self.breaker_until = 0.0
+            self.degrade_until = 0.0
+            self.last_error = ""
+            self.last_error_detail = ""
+            self.cooldown_until = 0.0
+
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
         if not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
         with self._throttle_lock:
-            wait = max(0.0, self.cooldown_until - now)
+            wait = max(0.0, self.cooldown_until - now,
+self.balance_until - now, self.breaker_until - now, self.degrade_until - now)
             if model:
                 wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
         return wait
@@ -1456,10 +1672,12 @@ class Account(object):
                 self.model_cooldowns.pop(model, None)
             else:
                 self.model_cooldowns.clear()
-            if self.last_error or self.cooldown_until or self.last_error_detail:
+            if (self.last_error or self.cooldown_until
+                    or self.last_error_detail or self.balance_until):
                 self.last_error = ""
                 self.last_error_detail = ""
                 self.cooldown_until = 0
+                self.balance_until = 0.0
 
 def _human_delta(seconds):
     if seconds is None: return None
@@ -2304,6 +2522,20 @@ def normalise_import_row(row, realm=None):
     so a file from either source imports cleanly. Raises ValueError when the
     row carries no usable credential.
     """
+    # cockpit tools exports a bare array of snake_case OAuth rows. Map it onto
+    # the flat shape the rest of this function already understands; expires_at
+    # is milliseconds, which normalize_epoch() below converts to seconds.
+    if (isinstance(row, dict) and "access_token" in row
+            and "accessToken" not in row):
+        row = {
+            "uid": row.get("uid"),
+            "nickname": row.get("nickname") or row.get("email") or "",
+            "domain": row.get("domain"),
+            "accessToken": row.get("access_token"),
+            "refreshToken": row.get("refresh_token"),
+            "expiresAt": row.get("expires_at"),
+            "source": "cockpit",
+        }
     auth = row.get("auth") if isinstance(row.get("auth"), dict) else None
     profile = row.get("account") if isinstance(row.get("account"), dict) else None
 
@@ -2353,7 +2585,7 @@ def normalise_import_row(row, realm=None):
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),
         "expiresAt": normalize_epoch(pick("expiresAt")) or jwt_exp(token),
-        "source": "import",
+        "source": str(pick("source") or "import"),
         "enabled": True,
         # Volatile state is intentionally reset - see VOLATILE_FIELDS.
         "lastError": "",
