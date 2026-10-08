@@ -617,11 +617,14 @@ a:hover{text-decoration:underline}
   var ATTRS = ['title', 'placeholder', 'aria-label', 'data-label', 'alt'];
   var SKIP = {SCRIPT: 1, STYLE: 1, TEXTAREA: 1, NOSCRIPT: 1};
   var DICT = {
+    '(不勾选 = 不限制；当前出口的模型)': '(unticked = no restriction; the current exit models)',
+    '(0 = 不限)': '(0 = no limit)',
     '(不限)': '(unlimited)',
     '(仅桌面端对话)': '(desktop chats only)',
     '(低于': '(below',
     '(共': '(total',
     '(其他)': '(other)',
+    '(另一出口)': '(another exit)',
     '(夜间0.5x)': '(0.5x at night)',
     '(已保存:': '(saved:',
     '(已关闭)': '(off)',
@@ -634,6 +637,7 @@ a:hover{text-decoration:underline}
     '(每': '(every',
     '(每账号每天': '(per account per day',
     '(每账号每模型每天': '(per account per model per day',
+    '(留空 = 永久有效；到期后该 Key 自动失效)': '(empty = never expires; the key stops working once it passes)',
     '(直通)': '(passthrough)',
     '(第': '(page',
     '(连续': '(streak',
@@ -644,8 +648,11 @@ a:hover{text-decoration:underline}
     '0 个 Key': '0 keys',
     '0 个 Key 生效': '0 keys active',
     '0 次': '0 calls',
+    '30 天': '30 days',
+    '1 天': '1 day',
     '429 自动切换出站身份': '429 auto-switch outbound identity',
     '429 自动切换出站身分': '429 auto-switch outbound identity',
+    '7 天': '7 days',
     '7天内到期': 'expiring within 7 days',
     'API Key 不能为空': 'API Key cannot be empty',
     'API Key 与出口绑定': 'API Key exit binding',
@@ -658,7 +665,10 @@ a:hover{text-decoration:underline}
     'OpenRouter 价估算：按 OpenRouter 公布的模型价折算，覆盖该账号在所选区间内的请求；按条件定价的模型（输入长度阈值或时段）按每条请求取档；单条请求实际用的策略、三档单价与匹配来源见「最近请求」里那条的悬停提示': 'OpenRouter estimate: converted from the model prices OpenRouter publishes, covering the requests of this account in the selected range; conditionally priced models (input-length thresholds or time windows) are tiered per request; the policy a single request actually used, its three unit prices and the match source are in the hover tip of that row in Recent requests',
     'OpenRouter 价估算：按该行（模型·区域·账号）的 token 消耗折算；按条件定价的模型（输入长度阈值或时段）按每条请求取档；单条请求实际用的策略、三档单价与匹配来源见「最近请求」里那条的悬停提示': 'OpenRouter estimate: converted from the token usage of this row (model · region · account); conditionally priced models (input-length thresholds or time windows) are tiered per request; the policy a single request actually used, its three unit prices and the match source are in the hover tip of that row in Recent requests',
     'OpenRouter 无对应': 'no OpenRouter match',
+    'Token 不限': 'No token limit',
+    'Token 已用': 'Tokens used',
     'Token 消耗与推理指标透视': 'Token usage and reasoning metrics',
+    'Token 额度上限': 'Token quota cap',
     'WorkBuddy 独立桌面客户端 (WB)': 'WorkBuddy standalone desktop client (WB)',
     'WorkBuddy 用量看板': 'WorkBuddy Usage Dashboard',
     'WorkBuddy 网关看板': 'WorkBuddy Gateway Dashboard',
@@ -667,6 +677,7 @@ a:hover{text-decoration:underline}
     '] 已保存': '] saved',
     '] 已启用': '] enabled',
     '] 已禁用': '] disabled',
+    '] 的 Token 用量计数清零？此操作不会改动额度上限。': ']? This does not change the quota cap.',
     'tok 达限': 'tok limit reached',
     'token 后暂停接单': 'token, order taking pauses',
     'token 后该模型切走': 'token, that model is switched away',
@@ -693,6 +704,7 @@ a:hover{text-decoration:underline}
     '上次取价': 'Last price fetch',
     '上次失败：': 'Last failure:',
     '上游中断': 'Upstream interrupted',
+    '上限': 'cap',
     '上面的美元单价按它折算成人民币）': ', converted to CNY at that rate)',
     '下一页': 'Next',
     '下次': 'Next',
@@ -709,6 +721,7 @@ a:hover{text-decoration:underline}
     '个保留积分': 'reserved credits',
     '个停用': 'disabled',
     '个可用出口': 'reachable exits',
+    '个已过期': 'expired',
     '个未绑定账号分配代理出口': 'unbound accounts assigned a proxy exit',
     '个槽位，记得点「保存槽位」': 'slots, remember to click Save slots',
     '个模型 ·': 'models ·',
@@ -757,6 +770,7 @@ a:hover{text-decoration:underline}
     '停用': 'Disable',
     '全维度统计输入/输出/推理 Token、缓存节省效益与各账号各模型用量': 'Full statistics on input/output/reasoning tokens, cache savings and per-account, per-model usage',
     '全自动批量接取、事件上报点亮并领取官方成长积分 (+1450分)，以及猫猫日常与打卡': 'Fully automatic batch claiming, event reporting and claiming of the official growth credits (+1450), plus the cat daily routine and check-in',
+    '全选': 'Select all',
     '全部': 'All',
     '全部停用': 'Disable all',
     '全部历史': 'All time',
@@ -833,6 +847,7 @@ a:hover{text-decoration:underline}
     '变体名未命中基准': 'variant name matched no base',
     '变体后缀继承': 'Variant suffix inheritance',
     '可用': 'Available',
+    '可用模型': 'Available models',
     '可用账号池': 'Usable account pool',
     '各账号用量透视与模型消耗分布': 'Per-account usage and model consumption breakdown',
     '同一批请求按调用方使用的 API Key 再分一次组，用于把消耗归属到人 / 项目': 'The same requests regrouped by the API key the caller used, so usage can be attributed to a person or a project',
@@ -901,6 +916,7 @@ a:hover{text-decoration:underline}
     '导出失败:': 'Export failed:',
     '导出日志失败:': 'Exporting logs failed:',
     '导出账号': 'Export accounts',
+    '将 Key [': 'Reset the token counter of key [',
     '将为每个已启用的国际版账号各建一个网页端会话。 这会真的起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。继续？': 'One web-side session will be created for every enabled Global account. This really runs a task and spends a few credits from that account, to count toward the official daily activity. Continue?',
     '将新增': 'Will add',
     '将覆盖': 'Will overwrite',
@@ -965,6 +981,7 @@ a:hover{text-decoration:underline}
     '已达成': 'Achieved',
     '已过期': 'Expired',
     '已进入面板': 'Signed in to the dashboard',
+    '已重置 Token 用量': 'Token usage reset',
     '已领取': 'Claimed',
     '平均首字延迟': 'Average time to first token',
     '平均首字延迟 0 ms · 耗时 0 s': 'Average time to first token 0 ms · duration 0 s',
@@ -974,6 +991,7 @@ a:hover{text-decoration:underline}
     '当前为「全部历史」视图，两张卡片口径相同': 'Currently in the All time view; both cards use the same basis',
     '当前仍在使用默认密码': 'You are still using the default password',
     '当前密码': 'Current password',
+    '当前已用': 'Used so far',
     '当前是默认密码 admin，建议到「设置」里修改': 'The password is still the default admin; change it in Settings',
     '当前浅色': 'currently light',
     '当前深色': 'currently dark',
@@ -1041,6 +1059,7 @@ a:hover{text-decoration:underline}
     '旅行中...': 'Travelling...',
     '旅行归来！待领奖': 'Back home! Reward pending',
     '无效': 'Invalid',
+    '无效时间': 'Invalid time',
     '无法解析': 'Could not parse',
     '无法读取的凭证': 'Unreadable credentials',
     '无法连接反代': 'Cannot reach the reverse proxy',
@@ -1075,6 +1094,7 @@ a:hover{text-decoration:underline}
     '有': '',
     '有剩余': 'Left',
     '有效期': 'Valid until',
+    '有效至': 'Valid until',
     '服务运行平稳': 'Service running smoothly',
     '未保存': 'Not saved',
     '未公布，按未命中价计': 'not published, charged at the unmatched price',
@@ -1117,6 +1137,7 @@ a:hover{text-decoration:underline}
     '槽位还没有填写代理地址': 'The slot has no proxy address yet',
     '模型': 'Model',
     '模型 ID': 'Model ID',
+    '模型列表尚未加载，稍后重试；留空表示不限制。': 'The model list has not loaded yet; try again later. Empty means no restriction.',
     '模型名称': 'Model name',
     '模型性能指标与用量一览': 'Model performance and usage',
     '模型能力': 'Capabilities',
@@ -1149,6 +1170,8 @@ a:hover{text-decoration:underline}
     '每账号每日上限（token）': 'Daily cap per account (tokens)',
     '每账号每日上限（积分）': 'Daily cap per account (credits)',
     '每账号每模型每日上限（token）': 'Daily cap per account per model (tokens)',
+    '永久': 'Never',
+    '永久有效': 'Never expires',
     '汇率：1 USD =': 'Rate: 1 USD =',
     '没有勾选任何出口': 'No exits ticked',
     '没有可导入的账号。': 'No accounts to import.',
@@ -1235,6 +1258,7 @@ a:hover{text-decoration:underline}
     '签到成功': 'Check-in succeeded',
     '系统': 'System',
     '累计': 'Total',
+    '累计总 Token，用满后自动停用': 'Cumulative tokens; the key is disabled once used up',
     '累计消耗 Token': 'Tokens used in total',
     '绑定账号': 'Bound accounts',
     '结果': 'Result',
@@ -1295,6 +1319,7 @@ a:hover{text-decoration:underline}
     '该账号仅此模型受限；时间为本地时间': 'only this model is restricted for this account; times are local',
     '该账号属于': 'This account belongs to the',
     '说明': 'Description',
+    '请先保存这个 Key 再重置用量': 'Save this key before resetting its usage',
     '请先登录或导入一个': 'Sign in or import a',
     '请填写 0 或正数（分钟）': 'Enter 0 or a positive number (minutes)',
     '请填写 0 或正整数': 'Enter 0 or a positive integer',
@@ -1375,6 +1400,8 @@ a:hover{text-decoration:underline}
     '部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索走 DuckDuckGo，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。': 'Some clients (such as the Codex App) declare server-side tools like web_search / web_fetch, but the upstream has no executor for them: the declaration goes up, the model sees the tool with nothing to run it, and the client ends up with nothing but unsupported call. With this on, the gateway runs them instead: it swaps the declaration for its own same-named function, runs it locally (search through DuckDuckGo, page fetch for that URL) and feeds the result back to the model. Off by default; when off the declaration passes through untouched and search tools the client declares itself still get called.',
     '重新扫描': 'Rescan',
     '重新生成链接': 'Regenerate link',
+    '重置用量': 'Reset usage',
+    '重置失败:': 'Reset failed:',
     '错误': 'errors',
     '长期有效': 'No expiry',
     '限': 'cap',
@@ -1454,7 +1481,9 @@ a:hover{text-decoration:underline}
     [/有 (\d+) 把 Key 没有绑定出口/, function(m, n){ return n + ' keys have no exit bound'; }],
     [/共 (\d+) 条记录/, function(m, n){ return n + ' records'; }],
     [/第 (\d+) \/ (\d+) 页 · 共 ([\d,]+) 条记录/, function(m, a, b, c){ return 'Page ' + a + ' / ' + b + ' · ' + c + ' records'; }],
-    [/共 (\d+) 个，启用 (\d+) 个/, function(m, a, b){ return a + ' total, ' + b + ' enabled'; }]
+    [/共 (\d+) 个，启用 (\d+) 个/, function(m, a, b){ return a + ' total, ' + b + ' enabled'; }],
+    [/限 (\d+) 个模型/, function(m, n){ return 'Limit ' + n + ' models'; }],
+    [/，(\d+) 个已过期/, function(m, n){ return ', ' + n + ' expired'; }]
   ];
   var KEYS = Object.keys(DICT);
   KEYS.sort(function(a, b){ return b.length - a.length; });
@@ -5269,7 +5298,7 @@ async function loadSettings(showToast){
       const rows = data.api_keys || [];
       const count = rows.filter(k => k.enabled && !keyIsExpired(k)).length;
       const expired = rows.filter(k => k.enabled && keyIsExpired(k)).length;
-      keyState.textContent = (count ? ('(' + count + ' 个生效') : '(当前不校验)')
+      keyState.textContent = (count ? ('(' + count + ' 个生效)') : '(当前不校验)')
         + (expired ? ('，' + expired + ' 个已过期') : '');
       keyState.style.color = expired ? 'var(--warn)' : (count ? 'var(--accent2)' : 'var(--dim)');
     }
