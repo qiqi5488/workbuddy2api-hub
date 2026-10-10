@@ -8,7 +8,6 @@ network access and no real accounts.
 import base64
 import json
 import os
-import socket
 import sys
 import tempfile
 import threading
@@ -20,6 +19,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+import _lifecycle as life  # noqa: E402  (shared spare-port pick)
 
 WORK = tempfile.mkdtemp(prefix="anthropic-http-")
 ACCOUNTS = os.path.join(WORK, "accounts")
@@ -54,15 +56,7 @@ with open(os.path.join(ACCOUNTS, "acct1.json"), "w", encoding="utf-8") as fh:
     }, fh)
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-UPSTREAM_PORT = free_port()
+UPSTREAM_PORT = life.free_port()
 MOCK = {
     "stream": True,
     "chunks": [],
@@ -136,7 +130,7 @@ for key in list(_ENDPOINTS):
     _ENDPOINTS[key] = ("http://127.0.0.1:%d" % UPSTREAM_PORT, _ENDPOINTS[key][1])
 wb_identity._ENDPOINTS.update(_ENDPOINTS)
 
-GATEWAY_PORT = free_port()
+GATEWAY_PORT = life.free_port()
 
 
 class Args(object):
@@ -280,9 +274,9 @@ try:
         ("missing model", {"messages": [{"role": "user", "content": "hi"}]}),
         ("empty messages", {"model": "deepseek-v4.1-flash", "messages": []}),
         ("messages not a list", {"model": "deepseek-v4.1-flash", "messages": "x"}),
-        ("system role in messages",
+        ("unsupported role in messages",
          {"model": "deepseek-v4.1-flash",
-          "messages": [{"role": "system", "content": "s"}]}),
+          "messages": [{"role": "tool", "content": "s"}]}),
     ):
         code, _h, body = request("POST", "/v1/messages", bad,
                                  headers={"x-api-key": "TESTKEY"})
@@ -307,7 +301,10 @@ try:
         "POST", "/v1/messages",
         {"model": "deepseek-v4.1-flash", "max_tokens": 64,
          "system": [{"type": "text", "text": "be brief"}],
-         "messages": [{"role": "user", "content": [{"type": "text", "text": "say hi"}]}]},
+         "messages": [
+             {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+             {"role": "system", "content": [{"type": "text", "text": "hook ctx"}]},
+         ]},
         headers={"x-api-key": "TESTKEY"})
     msg = json.loads(body or b"{}")
     check("200 with JSON", code == 200
@@ -327,6 +324,9 @@ try:
               for m in sent.get("messages") or []), sent.get("messages"))
     check("upstream saw the user text",
           any(m.get("role") == "user" and "say hi" in str(m.get("content"))
+              for m in sent.get("messages") or []), sent.get("messages"))
+    check("mid-conversation system role reaches upstream as a system message",
+          any(m.get("role") == "system" and "hook ctx" in str(m.get("content"))
               for m in sent.get("messages") or []), sent.get("messages"))
 
     print()

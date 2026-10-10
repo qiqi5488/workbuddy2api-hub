@@ -3,8 +3,9 @@
 负责常驻后台自动执行：
 1. Token 保活 (Keepalive)：定期检查 Token 剩余寿命，不足 2 小时自动调用 Refresh Token。
 2. 每日签到 (Daily Checkin)：每日定时为所有国内版账号自动签到领积分。
-3. 猫猫旅行与日常结算 (Cat Travel & Welfare)：自动派出猫猫旅行或领取归来奖励。
-4. 状态持久化与看板展示：暴露状态、执行记录、支持手动立即触发与开关切换。
+3. 对话活跃上报 (Activity Report)：每日定时为国内版账号上报轻量会话事件，点亮连登与热力墙。
+4. 猫猫旅行与日常结算 (Cat Travel & Welfare)：自动派出猫猫旅行或领取归来奖励。
+5. 状态持久化与看板展示：暴露状态、执行记录、支持手动立即触发与开关切换。
 """
 import threading
 import time
@@ -128,6 +129,7 @@ class Scheduler:
 
         refreshed_count = 0
         checkin_count = 0
+        report_count = 0
         travel_count = 0
         daily_chat_count = 0
 
@@ -147,12 +149,22 @@ class Scheduler:
             if acc.realm == "cn":
                 if acc.can_checkin():
                     self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
-                    res = acc.checkin()
+                    res = acc.checkin(trigger="scheduler")
                     if res.get("ok"):
                         checkin_count += 1
                         self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
                     else:
                         self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
+                    time.sleep(1.0)
+
+                if acc.can_report_activity():
+                    self.log(f"检测到国内版账号 [{uid8}] 今日尚未活跃上报，执行对话活跃上报...")
+                    res = acc.report_activity()
+                    if res.get("ok"):
+                        report_count += 1
+                        self.log(f"✓ 账号 [{uid8}] {res.get('msg')}")
+                    else:
+                        self.log(f"! 账号 [{uid8}] 对话活跃上报失败: {res.get('error') or res.get('msg')}")
                     time.sleep(1.0)
 
                 # 检查猫猫旅行
@@ -174,21 +186,24 @@ class Scheduler:
             if acc.realm == "intl":
                 if acc.can_daily_chat():
                     self.log(f"检测到国际版账号 [{uid8}] 今日尚未活跃，执行每日活跃打卡对话...")
-                    res = acc.daily_chat()
+                    res = acc.daily_chat(trigger="scheduler")
                     if res.get("ok"):
                         daily_chat_count += 1
-                        self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功")
+                        # 桌面端那条几乎不会失败，真正决定积分的网页通道就在 msg
+                        # 里（completed：N 段输出 / 失败原因），日志不带上它的话，
+                        # 面板只显示「成功」，第二天才发现积分没到（issue #236）。
+                        self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功: {res.get('msg')}")
                     else:
                         self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {res.get('error') or res.get('msg')}")
                     time.sleep(1.5)
 
-        self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")
+        self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")
 
     def status(self):
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到旅行 · 22:00 保活 · 01:00 夜猫)",
-            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 22:00 保活 · 01:00 夜猫)",
+            "mode": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫)",
+            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫)",
             "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)",
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
