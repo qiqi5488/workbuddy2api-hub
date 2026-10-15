@@ -43,6 +43,20 @@ def make_account(uid="u1", realm="cn", **extra):
 
 
 class CanReportActivityTests(unittest.TestCase):
+    def test_can_checkin_skips_enterprise(self):
+        acc = make_account(uid="ent-chk", realm="cn", enterpriseId="ent-1")
+        self.assertFalse(acc.can_checkin())
+        res = acc.checkin()
+        self.assertFalse(res.get("ok"))
+        self.assertIn("enterprise", res.get("error", ""))
+
+    def test_can_report_activity_skips_enterprise(self):
+        acc = make_account(uid="ent-rep", realm="cn", enterpriseId="ent-1")
+        self.assertFalse(acc.can_report_activity())
+        res = acc.report_activity()
+        self.assertFalse(res.get("ok"))
+        self.assertIn("enterprise", res.get("error", ""))
+
     def test_intl_account_never_reports(self):
         acc = make_account(realm="intl")
         self.assertFalse(acc.can_report_activity())
@@ -140,6 +154,34 @@ class SchedulerActivityReportTests(unittest.TestCase):
             scheduler._run_cycle("测试第二轮")
             self.assertEqual(report_calls, ["cn-due"])
             self.assertTrue(any("活跃上报 0 个" in log for log in scheduler.logs))
+
+
+
+
+
+class StreakBonusTests(unittest.TestCase):
+    def test_skips_intl_account(self):
+        acc = make_account(uid="intl-bonus", realm="intl")
+        res = wb_tasks.run_streak_bonus(acc)
+        self.assertFalse(res.get("ok"))
+        self.assertIn("仅限国内版", res.get("msg"))
+
+    def test_skips_enterprise_account(self):
+        acc = make_account(uid="ent-bonus", realm="cn", enterpriseId="ent-123")
+        res = wb_tasks.run_streak_bonus(acc)
+        self.assertTrue(res.get("ok"))
+        self.assertIn("企业版", res.get("msg"))
+
+    def test_streak_bonus_executes_safely(self):
+        acc = make_account(uid="cn-bonus", realm="cn")
+        with mock.patch.object(wb_tasks._accounts, "urlopen") as mock_url:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"code": 0, "data": {}}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_url.return_value = mock_resp
+
+            res = wb_tasks.run_streak_bonus(acc)
+            self.assertTrue(res.get("ok"))
 
 
 if __name__ == "__main__":

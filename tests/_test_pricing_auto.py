@@ -20,6 +20,7 @@ catalogue is exercised separately, in the deployment check.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -197,8 +198,8 @@ class UnionInputTests(PricingTestCase):
         def fake(realm):
             asked.append(realm)
             if realm == "cn":
-                return [("glm-5.3-flashx", {}), ("kimi-k2.6", {})], True
-            return [("glm-5.3-flashx", {}), ("glm-5.3-flash", {})], True
+                return [("glm-5.3-flashx", {}), ("kimi-k2.6", {})], True, "remote"
+            return [("glm-5.3-flashx", {}), ("glm-5.3-flash", {})], True, "remote"
 
         P.curated_live_sources = fake
         try:
@@ -216,7 +217,7 @@ class UnionInputTests(PricingTestCase):
         def fake(realm):
             if realm == "cn":
                 raise RuntimeError("cn catalogue down")
-            return [("glm-5.3-flashx", {})], True
+            return [("glm-5.3-flashx", {})], True, "remote"
 
         P.curated_live_sources = fake
         try:
@@ -237,6 +238,40 @@ class UnionInputTests(PricingTestCase):
             self.assertIn(alias, unpriced)  # unchanged from before the change
         for alias in ALIASES:
             self.assertNotIn(alias, overridden)
+
+
+# Run in a fresh interpreter: set up a gateway standing in for __main__, then
+# import wb_pricing and see what that left in sys.modules. __ROOT__ is the
+# directory wb_pricing itself was imported from, so a mutated copy beside this
+# test is the one the probe loads.
+_TWIN_IMPORT_PROBE = '''\
+import sys
+sys.path.insert(0, __ROOT__)
+
+
+class FakeGateway(object):
+    """Stands in for the running `python wb_proxy.py` instance."""
+
+    VIRTUAL_ALIAS_MODELS = ("default-model", "auto")
+
+    def curated_live_sources(self, realm):
+        return ([], True, None)
+
+
+sys.modules["__main__"] = FakeGateway()
+
+import wb_pricing  # noqa: E402
+
+problems = []
+if wb_pricing.gateway_module() is not sys.modules["__main__"]:
+    problems.append("gateway_module() did not resolve to the running __main__, "
+                    "so this probe is not measuring what it thinks it is")
+if "wb_proxy" in sys.modules:
+    problems.append("importing wb_pricing executed wb_proxy a second time")
+if problems:
+    print("\\n".join(problems))
+    raise SystemExit(1)
+'''
 
 
 class SingleGatewayInstanceTests(PricingTestCase):
@@ -262,7 +297,7 @@ class SingleGatewayInstanceTests(PricingTestCase):
 
             def curated_live_sources(self, realm):
                 self.realms.append(realm)
-                return ([("gpt-6-sol", {})], True)
+                return ([("gpt-6-sol", {})], True, "remote")
 
             def add_log_entry(self, message, tag=None):
                 self.lines.append((message, tag))
@@ -306,14 +341,31 @@ class SingleGatewayInstanceTests(PricingTestCase):
             self.assertIs(wb_pricing.gateway_module(), P)
 
     def test_nothing_imports_wb_proxy_behind_the_resolver(self):
-        """A stray plain import anywhere else would recreate the twin."""
-        path = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), "wb_pricing.py")
-        with open(path, encoding="utf-8") as fh:
-            source = fh.read()
-        hits = [line.strip() for line in source.splitlines()
-                if line.strip().startswith("import wb_proxy")]
-        self.assertEqual(hits, ["import wb_proxy as module"])
+        """Importing wb_pricing must not bring a second wb_proxy with it.
+
+        The gateway runs as `python wb_proxy.py`, so the live instance is
+        __main__; any `import wb_proxy` that executes while wb_pricing is being
+        imported runs that file a second time and produces the twin with no
+        account pool and its own log buffer.
+
+        This used to scan wb_pricing.py for a line starting with
+        "import wb_proxy". A scan can only say the text is there, not when it
+        runs: moving the lazy fallback in gateway_module() to module level
+        leaves the line byte-identical, and `from wb_proxy import Handler` is
+        not that text at all - both recreate the twin while the scan stays
+        green. It also went red for a docstring that merely quoted the line.
+        Asking a real interpreter what it ended up importing has neither
+        problem.
+        """
+        probe = _TWIN_IMPORT_PROBE.replace(
+            "__ROOT__",
+            repr(os.path.dirname(os.path.abspath(wb_pricing.__file__))))
+        result = subprocess.run([sys.executable, "-c", probe],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            result.returncode, 0,
+            "importing wb_pricing pulled in a second wb_proxy:\n"
+            + (result.stdout or "") + (result.stderr or ""))
 
 
 class OnDemandPricingTests(PricingTestCase):
@@ -594,7 +646,7 @@ class GapReportTests(PricingTestCase):
         original = P.curated_live_sources
         P.curated_live_sources = lambda realm: (
             ([("glm-5.3-flash-20260101", {})] if realm == "intl"
-             else [("glm-5.3-flashx", {})]), True)
+             else [("glm-5.3-flashx", {})]), True, "remote")
         try:
             refresher = self._refresher()
             ok, message = refresher.run_once()

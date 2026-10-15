@@ -36,7 +36,7 @@ class Scheduler:
         # in the same log the panel shows.
         wb_tasks.set_logger(self.log)
 
-    def log(self, msg):
+    def log(self, msg, tag=None):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{ts}] {msg}"
         self.logs.append(entry)
@@ -44,7 +44,15 @@ class Scheduler:
             self.logs = self.logs[-60:]
         try:
             import wb_proxy
-            wb_proxy.add_log_entry(f"[调度器] {msg}", tag="scheduler")
+            # 任务/打卡/旅行类条目同时进入 tasks 模块日志，方便分类查看
+            effective_tag = tag
+            if not effective_tag:
+                lower = str(msg).lower()
+                if any(k in lower for k in ("签到", "打卡", "活跃", "猫猫", "连登", "夜猫", "抽奖", "兑换")):
+                    effective_tag = "tasks"
+                else:
+                    effective_tag = "scheduler"
+            wb_proxy.add_log_entry(f"[调度器] {msg}", tag=effective_tag)
         except Exception:
             pass
 
@@ -174,6 +182,13 @@ class Scheduler:
                     self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
                 time.sleep(1.0)
 
+                # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）
+                bonus = wb_tasks.run_streak_bonus(acc)
+                if bonus.get("logs"):
+                    for l in bonus["logs"]:
+                        self.log(f"★ 账号 [{uid8}] {l}")
+                    time.sleep(1.0)
+
                 # 01:00 夜猫子专属任务: black_cat 只在 23:00-08:00 上报计数,
                 # 之前这个整点只是空转通用巡检, 从未真正上报过夜猫事件。
                 if time.localtime().tm_hour in self.cat_hours:
@@ -189,9 +204,8 @@ class Scheduler:
                     res = acc.daily_chat(trigger="scheduler")
                     if res.get("ok"):
                         daily_chat_count += 1
-                        # 桌面端那条几乎不会失败，真正决定积分的网页通道就在 msg
-                        # 里（completed：N 段输出 / 失败原因），日志不带上它的话，
-                        # 面板只显示「成功」，第二天才发现积分没到（issue #236）。
+                        # 成功时也把网页通道那一轮的结果带上（completed：N 段输出），
+                        # 光看「成功」分不清是真跑完了还是只有桌面腿过了（issue #236）。
                         self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功: {res.get('msg')}")
                     else:
                         self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {res.get('error') or res.get('msg')}")
