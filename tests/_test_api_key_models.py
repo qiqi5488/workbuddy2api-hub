@@ -142,7 +142,9 @@ work = tempfile.mkdtemp(prefix="wbkeymodels_")
 store = os.path.join(work, "accounts")
 os.makedirs(store)
 with open(os.path.join(store, "settings.json"), "w", encoding="utf-8") as fh:
-    json.dump({"api_keys": [
+    # The Anthropic Messages route ships disabled by default since v1.7.6, and
+    # this suite checks the per-key model gate on all three chat routes.
+    json.dump({"enable_anthropic_messages": True, "api_keys": [
         {"id": "k1", "name": "restricted", "key": "KEYRESTRICTED",
          "models": ["deepseek-v4.1-flash"], "enabled": True},
         {"id": "k2", "name": "open", "key": "KEYOPEN", "enabled": True},

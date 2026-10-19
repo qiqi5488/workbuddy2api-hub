@@ -1,3 +1,186 @@
+## v1.7.16
+
+国内版上游可改址、面板稳定性与英文界面修复：新增 WB_CN_CHAT_UPSTREAM，海外出口可把国内版对话 / 刷新 / 任务一起切到 www.workbuddy.cn（#465）；修复空数据时 Token 时序悬停崩溃、英文界面词级拼接、区间切换串号与轮询 304 不命中（#470）。套件 172 个（127 Python + 45 JS）。
+
+- **国内版对话上游可通过 `WB_CN_CHAT_UPSTREAM` 改址**：`copilot.tencent.com` 从海外出口（代理软件全局模式等）连接时 TLS 握手被复位（`SSL: UNEXPECTED_EOF_WHILE_READING` / `WinError 10054`），国内版对话、刷新 token、模型目录、签到与成长任务全部失败，账号还会因此被熔断。设 `WB_CN_CHAT_UPSTREAM=https://www.workbuddy.cn` 后，桌面端 / CLI 身分的对话端点、`REALM_CONFIGS["cn"]["chat_upstream"]` 与成长任务的 `CHAT_BASE` 一起改走该地址；`X-Domain` 仍用账号自己的 domain。不设时行为与此前完全一致。
+  `WB_CN_CHAT_UPSTREAM` overrides the China-realm chat upstream. From an overseas exit (e.g. a proxy in global mode) the TLS handshake to `copilot.tencent.com` is reset, so China-realm chat, token refresh, the model catalogue, check-in and growth tasks all fail and accounts get tripped by the breaker. With `WB_CN_CHAT_UPSTREAM=https://www.workbuddy.cn` the desktop / CLI chat endpoints, `REALM_CONFIGS["cn"]["chat_upstream"]` and the growth-task `CHAT_BASE` all move to that host; `X-Domain` still comes from the account's own domain. Unset, nothing changes.
+- **面板三处缺陷与 README 结构修正**（#470）：空数据时 Token 时序图悬停不再抛 TypeError；补齐 12 条英文短语词条，消除「Taskand福利」「callsRequests」这类杂交串；区间切换加代次保护，迟到的旧响应会被丢弃，轮询窗口上界量化到 15 秒桶，连续轮询也能命中 304；README 的 §二 小节号与断开的端点表一并修正。
+
+## v1.7.15
+
+账号面板的模型冷却 / 达日限额提醒改为整行展示：长模型名与恢复时刻不再被 180px 账号列截断，悬停提示只保留原因与影响范围（#461）。套件 170 个（126 Python + 44 JS）。
+
+- **账号列的提醒胶囊改成整行完整显示**：账号列宽 180px，模型冷却胶囊（`模型 · 撞线 X · 恢复 Y`）与按模型达日限额胶囊（`模型 · 今日已用 N / 上限 M token 已达限额`）原本挤在这一列里，`white-space:nowrap` + 省略号让模型名一长（如 `deepseek-v4.1-flash`）就把时刻整段切掉。现在这两类胶囊从账号列拆出，紧跟账号行另起一整行（`colspan` 跨满表头列数，窄屏 grid 下跨满 6 栏），文本自己完整：模型名、撞线 / 恢复时刻、本地时间口径，达限那类还带已用 / 上限数值与 0 点恢复。**悬停提示只保留可见文本没说的部分**——上游判定额度用满（code 6004）/ 临时限流（429）等原因，以及「仅此模型受限，同账号其他模型照常接单」的影响范围；模型名与时刻已画在胶囊上，不再在悬停里重复一遍。这一行是账号行的**续行**，两行之间不画分割线（账号行交出 `td` 默认的 `border-bottom`，续行也不画 `border-top`，窄屏下负 margin 把两张卡片拼成一块），悬停账号行时续行一起高亮，避免「徽章和所属账号像两块」的割裂感。排序仍按账号整体走，账号行 ↔ tbody 行的对应关系不变。
+  Model cooldown and per-model daily-limit pills no longer live in the 180px account column, where `nowrap` + ellipsis cut the timestamps off; they now render as their own full-width row right below the account row (`colspan` spanning every header column, 6 grid columns on narrow screens), carrying the model name, cap and reset times, the "times are local" note, and used-vs-cap counts for daily limits. **The tooltip keeps only what the pill does not already say**: the reason (quota exhausted with code 6004 / temporary 429) and the scope ("only this model is restricted, the account's other models still take traffic"). The model name and timestamps are drawn on the pill, so they are no longer repeated on hover. That row is a **continuation** of the account row: no divider is drawn between them (the account row gives up the `td` default `border-bottom`, the continuation draws no `border-top`, and on narrow screens a negative margin joins the two cards into one), and hovering the account row highlights the continuation too, so the pill never looks detached from the account it belongs to. Sorting still reorders whole account rows, so the account↔row mapping is unchanged.
+
+## v1.7.14
+
+渠道校验与账号治理、协议兼容与面板体验：传输层头名保真与按账号隔离连接、CLI / VSCode 身份对齐官方客户端、11140 默认停止换号并持久化（#429 / #431 / #448 / #450）；401 先刷新 token 再换号、自签证书代理支持 WB_CA_BUNDLE（#441 / #439 / #435）；补齐 Anthropic tool_result 图片结构化、工具结果插入顺序与函数 Schema 规整（#452 / #420 / #446 / #451）；新增按账号定址路由、排程时段配置、6004 标签修复、撞线样本区块（#455 / #456 / #454 / #253）。套件 169 个（126 Python + 43 JS）。
+
+- **修复自签证书代理导致的 OAuth 502**（#441）：证书校验失败是配置错误，不再按网络抖动重试 3 次。网关支持 `WB_CA_BUNDLE` / `SSL_CERT_FILE`，在系统根证书之外追加私有 CA；没配或配错时直接返回包含变量名和原始错误的提示，不再只显示一句 502。
+- **HTTP 401 先刷新 token 再换号**（#435、#439）：同一次请求内每个账号最多刷新一次，刷新成功优先重试同一个号；只有刷新失败或重试仍 401 才按原逻辑轮换。减少「凭证其实能恢复、却被当成坏号冷却」的情况。
+- **收紧 401 判定，避免中间层 HTML 401 锁死账号**（#440）：凭证失效的判定不再只看状态码；中间层返回 HTML 401 时不会再把账号标成 token 过期并停用，只有 JSON 凭证失效才走重新登录引导。
+- **剩余用量估算新增「撞线样本」区块**（#253）：按 (区域, 模型) 列出每个撞线窗口的原始值（账号、撞线时刻、窗口用量），并提供「复制为征集格式」按钮，方便汇总跨实例样本。数据来自现有 `limit-events`，不新增上游请求。
+- **修复工具结果前插入消息导致 11148**（#420）：`repack_tool_result_blocks` 以前在 `assistant tool_calls` 与第一条 `tool` 结果之间出现 user / developer 消息时直接放弃重排；现在会把这类插入消息移到整批结果之后，保证结果紧跟调用。
+- **按账号定址的调用入口**（#455）：新增 `/u/<ref>/v1/...`（`chat/completions`、`responses`、`models` 等），`<ref>` 支持完整 uid、uid 前 8 位或昵称；歧义 / 找不到 / 账号不可用都会如实报错，不会猜号或偷偷换号。不带 `/u/` 前缀的旧路径行为不变；定址请求同样走现有 API Key / 面板鉴权与用量统计。
+- **修复用量时序热力图跨日合并**（#447）：时序桶网格改为对齐本地午夜 / 整点，跨日查询不再把两天并进同一个桶。
+- **修复账号表 6004 短标签在冷却到期后不消失**（#454）：模型级 429 的 `lastError` 是历史记录，冷却到期后 `pills` 已空，面板仍把它画成账号级 `HTTP 429 · code:6004`；现在该哨兵值不再进入账号级错误标签，冷却期间仍由 `coolPills` 显示「撞线 / 恢复」。
+- **后台排程时段可配置**（#456）：`accounts/settings.json` 新增 `schedule` 段（`checkin` / `travel` / `keepalive` / `cat`，24 小时制，支持数组或逗号串），缺省 / 非法 / 越界 / 空逐项回落旧默认（09:00/21:00、22:00、01:00），按 mtime 缓存免重启生效；`/scheduler` 的 `mode` / `mode_cn` / `mode_intl` 按实际时段生成。
+- **修复 Anthropic `tool_result` 图片被拍平成文本**（#452）：`/v1/messages` 的工具结果里带图片时，base64 data URL 以前被当普通文本发给上游，按约 1 token/字符计费，一张截图就能把长上下文顶到 11115；现在含图时保留结构化 `image_url` 数组，纯文本仍折叠成字符串。实测同一张 31KB PNG 从约 3 万 input tokens 降到 665。
+- **修复函数参数 Schema 结构缺陷与工具参数反序列化失败导致上游 400 拦截**：针对客户端（如 Hermes Agent、各类 OpenAI 兼容 SDK 等）声明无参工具时发送 `"parameters": {}`（缺失顶层 `type: "object"`）触发上游 Go struct 校验拒绝报 `code 11129 invalid function call parameters` 的问题，网关层自动补齐 `type: "object"` 与 `properties: {}` 并清洗非法的 `required` 字段；同步修复历史对话消息中 `tool_calls[].function.arguments` 为字典对象导致上游反序列化失败（`code 11101`）的缺陷。
+- **自动切换出站身份支持配置允许的身份**：此前 429 自动换身分固定按 WB → VSC → CLI 轮转，无法排除某条身份（例如不想让账号落到某个身份上）。现在「设置 → 自动切换出站身份」可以勾选允许的 WB / VSC / CLI（至少一个），自动切换只在勾选的身份之间按原顺序轮转；未配置时默认三条全允许，行为与旧版一致。设置持久化在 `accounts/settings.json` 的 `auto_switch_products`，读取时会过滤未知值，保存时校验非法值返回 400。
+
+- **修复 Safari 无法复制 API Key**：面板只渲染遮罩后的 Key，复制时必先 `await /settings/reveal`，而 Safari 把剪贴板绑定在点击的 transient activation 上，`await` 之后 `writeText()` 以 `NotAllowedError` 拒绝。现在值已在手时同步写入、需取真值时改用 `ClipboardItem` 的 Promise 形式；`copyFilteredLogs()` 也改走 `writeClipboard()`，修掉纯 http 区网（非安全上下文）下的 `TypeError`。
+- 新增 `GET /v1/balance-summary`：使用模型 API Key 读取当前区域启用账号的积分汇总，仅返回余额、账号数量与快照时间；只读缓存，不刷新上游，也不暴露 UID、昵称或单账号信息。
+- 新增可选 `WB_PRESERVE_REQUEST_CONTRACT=1`（默认关闭，修改后重启网关）：将 Responses `text.format` 映射为 Chat `response_format`，保留 namespace 扁平函数的 `strict`，并跳过历史工具参数及 `tool` / `function` 结果的指纹替换，避免把 `11-128` 等业务数据改坏。其余角色文本仍沿用既有清洗；关闭时全部维持旧行为。此开关只保真字段和工具数据，不校验输出、不保证上游执行 JSON Schema 或 `tool_choice`。关闭开关并重启即可回退。
+  Opt in with `WB_PRESERVE_REQUEST_CONTRACT=1` (off by default; restart the gateway after changing it) to map Responses `text.format` to Chat `response_format`, preserve flat namespace function `strict`, and bypass fingerprint rewriting of historical tool arguments and `tool` / `function` results. Other role text keeps existing sanitization; disabled mode is unchanged. This preserves fields/data only: it neither validates output nor guarantees upstream JSON Schema / `tool_choice` enforcement. Unset the flag and restart to roll back.
+
+### 模型额度定时主动查询
+
+- **新增「模型额度定时主动查询」：不用等真实请求撞限额，就知道哪条配额线已经满了**。窗口探针（`wb_window_probe`）补的是下半段——某条配额线已经 429 之后，把重置时刻用掉；上半段此前没人管：一条线在被打满之前是完全黑盒的，只能等真实请求撞上去才暴露。现在在「设置 → 模型额度定时主动查询」勾选模型后，网关每 **6 小时**为每个「账号 + 模型」发一个最小请求体检：
+  - **查到 429 + 重置时刻** → 立刻记该模型的冷却（真实请求不再撞这条已满的线），并把重置时刻登记给窗口探针，到点抢占新一轮窗口；这条线之后**不再定时查询**——本地已经存了它的 429 记录，交给探针就够了。
+  - **请求通了** → 这条线还没到限额，继续按 6 小时轮询；探针成功、窗口记录撤销之后，轮询自动恢复。
+  - **网络/解析失败** → 不算查过（不会因此推迟整整一个周期），15 分钟后重试；连续失败到上限才推迟到下一个周期。
+  - 记录落在 `accounts/quota_scan.json`（原子写，**重启后仍保留每个组合的上次查询时刻**），重启不会让所有模型重新查一遍；一次性勾上一堆模型时，首次查询会自动错峰（相邻组合相隔 15 秒），不会在同一瞬间把请求全打上去。
+  - 默认**不勾选任何模型**（即关闭），勾了才会发请求——每次查询都会真的消耗该账号极少量额度。设置页能看到每个「账号 + 模型」的最近结果与下次查询时间，也可以点「立即查询」跳过等待；已经有 429 记录、或正在冷却中的组合不会被额外撞一次。
+- 新增 `tests/_test_quota_scan.py`（16 项）：钉住未勾选时什么都不做、查通之后要等满一个间隔、429 时既记冷却又登记窗口且之后停止轮询、失败不算查过并按短间隔重试、连续失败到上限才推迟到下一周期、持久化与重启视角、停用/无凭证/冷却中的组合被跳过、首次登记错峰与批次上限。
+- **出站 chat 请求：头名保真 + 按账号隔离连接 + 紧凑 JSON**：出站头名此前被 `urllib` / 连接池统一改写大小写（`X-Request-ID` → `X-Request-Id`、`X-IDE-*` → `X-Ide-*`、`traceparent` / `b3` → `Traceparent` / `B3`），与官方客户端代码里的写法不是同一字节串；现在 chat / 每日活跃 / 面板探活三条路径按原名原样发送，billing / 登录 / 签到等未传有序头的路径行为不变。连接池键新增凭据摘要（`Authorization` / `X-Refresh-Token` / `X-User-Id` 的 sha256 前 16 位）：同一出口上的不同账号不再共用同一条 TCP/TLS 连接（同一账号仍复用；`egress_key` 与退避 / 熔断口径不变）。chat 请求体改为紧凑 JSON（与 Node `JSON.stringify` 一致）。测试：`tests/_test_upstream_pool.py` 新增 [17] 头名保真 / [18] 按账号分池，`tests/_test_upstream_repairs.py` 新增 [6] 紧凑 JSON。
+- **CLI 身份对齐官方 CodeBuddy CLI 2.168.2**：`X-IDE-Version` 与 UA 升到
+  `2.168.2`（`CLI/2.168.2 CodeBuddy/2.168.2`；官方 adapter 会删掉 SDK 的
+  user-agent，CLI 也没有 userAgentExtension，所以是两段）；补齐官方 CLI 的
+  `X-Agent-Purpose` / `X-Agent-Type` / `X-Agent-Runtime`、`X-Private-Data`
+  （个人号 false、企业号 true）、四段 b3 链路头族（含 `X-B3-ParentSpanId`）
+  与 OpenAI Node SDK 6.25.0 的 `x-stainless-*` 指纹头（OS/arch/node 版本默认取
+  宿主，可用 `WB_IDENTITY_OS` / `WB_IDENTITY_ARCH` /
+  `WB_IDENTITY_NODE_VERSION` 覆盖）。`X-Conversation-ID`
+  按（账号, 会话键）稳定、`X-Conversation-Request-ID` 在一轮 user send 的
+  所有重试/换号里复用同一个值，`X-Request-ID` 仍等于
+  `X-Conversation-Message-ID`，`X-Root-Request-ID` = 本轮
+  `X-Conversation-Request-ID`。chat 请求去掉 Origin / Referer /
+  X-CodeBuddy-Request / X-Requested-With / Accept-Language，`Accept` 改为
+  `application/json`；请求体 gzip 并注入 `cache_retention=long`，CLI 身份
+  不再发 `X-Device-Token`。桌面端 / VSCode 身份行为不变。国际版端点仍是
+  `www.workbuddy.ai`（官方 CLI 用 `www.codebuddy.ai`，解析不了，属已知差异，
+  本版不改）。
+- **VSCode 身份对齐官方扩展 4.12.39997873**：UA 改为
+  `VSCode/1.119.0 CodeBuddy/4.12.39997873`（productName=CodeBuddy、扩展版本
+  4.12.39997873），补 `X-Product-Version` / `X-Model-ID` / `X-Agent-Type` /
+  `X-Private-Data`（仅 intl）/ B3 链路头族（含 `X-B3-ParentSpanId` 与四段 b3）/
+  `X-Request-Trace-Id` / `monitor_*` 时间戳；`X-Request-ID` 与
+  `X-Conversation-Request-ID` 同值、`X-Conversation-Message-ID` 独立，
+  `X-Conversation-ID` 为 32 位 hex（宿主 VSCode 版本默认 1.119.0，可用
+  `WB_VSCODE_IDE_VERSION` 覆盖）。桌面端 / CLI 身份行为不变。官方主 chat
+  默认请求体 gzip（`RequestBodyGzip=true` → `executeByMode` →
+  `createCustomFetch` 压缩），本版启用；非企业号没有真实设备 token 时按官方
+  失败态发 `X-Device-Token-Error: sdk_not_initialized`（不伪造 token）。
+- **阿里云 systemd 部署支持手动安装稳定版**：设置页可从配置的 fork Release 安装新版本；更新包必须通过 `SHA256SUMS` 与 `release-manifest.json` 校验，账号与用量目录列为保护路径。网关只提交版本号，root-owned systemd 更新服务负责备份、替换、重启与健康检查；失败会恢复程序文件。每日检查仍默认关闭，打开后也只检查、不自动安装。
+- **风控限制 403（code 11140）不再换号连坐：默认停手、限制持久化、整池暂停**（#422、#425）：上游对国际版账号的风控在 2026-10-15/16 之后明显收紧，账号级限制的正文是 `403 {"code":11140,"msg":"request illegal","displayMsg":"账号存在异常行为，已被限制使用"}`；社区复盘（[Zhengyuuuui/workbuddy2api](https://github.com/Zhengyuuuui/workbuddy2api/blob/main/doc/incident-postmortem-and-hardening-checklist.md)）给出的处置红线是「看到 11140 立即停手，解封前严禁换号继续打同一设备——设备指纹会连坐」。旧实现在 11140 上冷却该号后立刻换下一个号继续同一请求，一个请求最多遍历整个池子（#422 用户实测 7 个号在一次任务里全被封），而且冷却只存在内存里，重启 / 刷新 token / 「一键测试」都会把它清掉。现在：
+  - **默认不再跨号重试**：第一个账号被限制就停手，把原因交给客户端，下一次请求自然落到别的账号；需要旧行为时设 `WB_RESTRICTED_403_ROTATE_MAX`（默认 0）。
+  - **限制期限持久化**：账号档案新增 `restrictedUntil`（2 小时），重启 / 换身分 / 刷新凭证 / 一键测试都不再把它放回池子；只有真正成功一次（说明上游已解除）才清。
+  - **整池连坐暂停**：同一区域在 `WB_RESTRICTION_WAVE_WINDOW`（默认 900 秒）内被限制 `WB_RESTRICTION_WAVE_MIN`（默认 2）个账号，就暂停该区域派发 `WB_RESTRICTION_HOLD_SECONDS`（默认 1800 秒），期间一个上游请求都不发、直接返回 429 与申诉指引；设 `WB_RESTRICTION_HOLD_SECONDS=0` 关闭暂停。
+  - 后台巡检 / 打卡会跳过受限账号与暂停中的区域；「一键测试」识别到 11140 也按账号级限制记账，不再用 60 秒冷却覆盖。
+  - `tests/_test_restricted_403.py` 扩到 14 项（默认不换号 / 开关恢复旧行为 / 单号场景 / 连坐暂停 / 关闭暂停 / 持久化与清冷却 / 内容审核 403 不变）。
+- **国际版 chat 不再发送 `X-Device-Token`**：国内版客户端带真实 Turing Shield 设备 token，国际版客户端没有这个头（Zhengyuuuui 三轮抓包与 5.7.6 / 5.8.4 二进制构造器都不含）；网关配置的是全局单值，发给国际版账号既是伪造头、又把多个账号串到同一台设备上。billing 路径与国内版 chat 维持原行为。
+- **`X-Conversation-ID` 按会话稳定**：官方客户端同一会话复用同一个会话 id（主对话是 UUIDv4），网关此前每个请求都新生成，等于把一次多轮对话拆成上千个「一次性会话」。现在 chat 路径用 `wb_identity.conversation_id_for(uid, session_key)` 按「账号 + 会话键」稳定派生，不同账号 / 会话互不相同；客户端没带会话键时保持每请求新生成。
+
+## v1.7.13
+
+积分安全、便携部署与面板行为修复：请求结束后按上游回包的真实 credit 立即扣减缓存余额，`reserve_credits` 不再在两次刷新之间失效（#442）；便携包补回 `console_tail.py` 与 `pythonw.exe`，静默启动不再一闪而过（#416）；日志按钮改为跨平台新窗口打开运行日志（#427）；关闭服务用 `/health` 复核，容器或守护进程自动拉起时不再谎报成功（#426）；OpenWrt 包补齐 ssl / sqlite3 / codecs 依赖（#419）；补全 atrest 提示的英/正体词条并修正 README 徽章 alt（#415）。套件 160 个（117 Python + 43 JS）。
+
+- **请求结束立即扣减余额，低积分护栏不再失效**（#442）：`reserve_blocked()` 以前只读上一次 `fetch_credits()` 的缓存值，而刷新器每 30 分钟只刷一个号，48 个号的池子刷完一轮要 24 小时。现在每条完成的请求都会按上游回包里的 `credit` 扣减内存余额（加锁、下限 0），并同步 `used` 与百分比；后台刷新回来再校正。串行场景下 `reserve_credits` 立即生效，不会再出现「53 分钟扣 709 分、护栏全程没拦住」。
+- **便携包补回静默启动依赖**（#416）：`release/portable.txt` 新增 `console_tail.py`，精简运行时不再删除 `pythonw.exe`。双击 `start-wb-proxy*.bat` 后服务在后台静默运行、日志窗口正常弹出，不再「窗口一闪而过」；发布工作流的冒烟检查也会断言这两个文件在包内。
+- **日志按钮跨平台可用**（#427）：面板顶栏的眼睛按钮不再让服务端 `spawn` 进程，改为 `window.open('/dashboard?tab=logs')` 在新窗口打开运行日志。Windows / macOS / 容器走同一条路，不会再出现「Linux 上每次都提示已关闭」；`/console/toggle` 保留为兼容端点并返回 `mode=web`。
+- **关闭服务不再把失败渲染成成功**（#426）：点击电源按钮后轮询 `/health`，只有端口真的不再应答才标记「已关闭」；容器或守护进程把进程重新拉起时会如实提示「停止请求已发送，但服务仍在运行」，按钮也不会被永久禁用。
+- **OpenWrt 依赖补齐**（#419）：`DEPENDS` 增加 `python3-openssl`、`python3-sqlite3`、`python3-codecs`，避免安装后因缺少 ssl / sqlite3 / `encodings.idna` 而启动失败或域名解析报错。
+- **i18n 与 README 小修**（#415）：补上 `当前系统不支持从进程内存回收密钥。` 的英文与正体词条；README 徽章 `alt` 跟实际版本对齐。
+
+## v1.7.12
+
+用量监控、账号治理与体验全景升级：用量明细三维度统一接入真实消耗积分列并大幅提升深色模式文字对比度（#412）；支持账号与模型精确黑名单控制（#405、#402）；实时日志与最近请求表格直观展示发起方 API Key 标识（#401、#397）；软限流阶梯补全时间窗衰减并优化秒级可读剩余时间（#408）；桌面端 UA 与版本常量收敛至单一来源（#403）；定时调度巡检在账号之间加入随机错峰延时防 IP 集中风控（#394）；将根目录维护脚本归档至 tools/ 净化入口结构（#398）；对齐全量套件计数校验（158 个套件）。
+
+- **数据看板用量明细三维度统一「消耗积分」列**（#412）：账号维度表头由静态剩余积分改为当前时间范围内的真实「消耗积分」（window.credit），模型与 API Key 维度同步补齐消耗积分列，产生积分消耗时直观高亮展示。
+- **深色模式小字与弱文字对比度全面优化**（#412）：将深色模式下用于小字、轴标签及副标题的 --dim2 / --dim-light 从 #7c796f 提亮至 #9c9a90，在卡片与表头上达到 4.6~5.2:1 对比度，完全满足 WCAG AA 级 4.5:1 可读性标准；清晰勾勒热力图网格边界。
+- **支持按账号禁用个别模型**（#405、#402）：账号持久化支持 disabledModels 黑名单，控制台账号行点击「+ 禁用模型」可弹窗按当前区域复选框多选精确禁用，命中的模型不再派给该账号，其余模型与账号接单完全不受影响。
+- **实时日志与看板展示 API Key 标识**（#401、#397）：chat / chat done / messages / responses 四条日志行以及「最近请求」表格新增 API Key 列，直观辨别各请求的具体调用方。
+- **软限流阶梯时间窗与可读剩余时间**（#408）：soft_streak 与 unscoped_streak 同样纳入 WB_FAIL_WINDOW（默认 600 秒）时间窗衰减判定；冷却时间由「0 min」优化为「剩余 42s / 1m30s」等可读格式。
+- **定时调度账号随机错峰延时**（#394）：多账号在后台执行每日打卡与巡检时，在账号之间增加 2~5 秒动态随机浮动延时，防止整点请求集中引发出口 IP 频率风控。
+- **出站 UA 与版本号收敛至 wb_identity**（#403）：彻底清除代码内残留的硬编码 5.5.2 旧版常量。
+- **根目录调试脚本归档至 tools/**（#398）：净化根目录条目，使核心入口更清晰。
+
+## v1.7.11
+
+用量监控、账号治理与体验全景升级：用量明细三维度统一接入真实消耗积分列并大幅提升深色模式文字对比度（#412）；支持账号与模型精确黑名单控制（#405、#402）；实时日志与最近请求表格直观展示发起方 API Key 标识（#401、#397）；软限流阶梯补全时间窗衰减并优化秒级可读剩余时间（#408）；桌面端 UA 与版本常量收敛至单一来源（#403）；定时调度巡检在账号之间加入随机错峰延时防 IP 集中风控（#394）；将根目录维护脚本归档至 tools/ 净化入口结构（#398）。
+
+- **数据看板用量明细三维度统一「消耗积分」列**（#412）：账号维度表头由静态剩余积分改为当前时间范围内的真实「消耗积分」（window.credit），模型与 API Key 维度同步补齐消耗积分列，产生积分消耗时直观高亮展示。
+- **深色模式小字与弱文字对比度全面优化**（#412）：将深色模式下用于小字、轴标签及副标题的 --dim2 / --dim-light 从 #7c796f 提亮至 #9c9a90，在卡片与表头上达到 4.6~5.2:1 对比度，完全满足 WCAG AA 级 4.5:1 可读性标准；清晰勾勒热力图网格边界。
+- **支持按账号禁用个别模型**（#405、#402）：账号持久化支持 disabledModels 黑名单，控制台账号行点击「+ 禁用模型」可弹窗按当前区域复选框多选精确禁用，命中的模型不再派给该账号，其余模型与账号接单完全不受影响。
+- **实时日志与看板展示 API Key 标识**（#401、#397）：chat / chat done / messages / responses 四条日志行以及「最近请求」表格新增 API Key 列，直观辨别各请求的具体调用方。
+- **软限流阶梯时间窗与可读剩余时间**（#408）：soft_streak 与 unscoped_streak 同样纳入 WB_FAIL_WINDOW（默认 600 秒）时间窗衰减判定；冷却时间由「0 min」优化为「剩余 42s / 1m30s」等可读格式。
+- **定时调度账号随机错峰延时**（#394）：多账号在后台执行每日打卡与巡检时，在账号之间增加 2~5 秒动态随机浮动延时，防止整点请求集中引发出口 IP 频率风控。
+- **出站 UA 与版本号收敛至 wb_identity**（#403）：彻底清除代码内残留的硬编码 5.5.2 旧版常量。
+- **根目录调试脚本归档至 tools/**（#398）：净化根目录条目，使核心入口更清晰。
+
+- 国际版 `deepseek-v4.1-flash` 免费模型支持额度耗尽后回退到 `deepseek-v4.1-flash-sg` 积分版。默认关闭；仅当所有已启用账号都收到带重置时间的 6004 限额记录时才回退。设置网关环境变量 `WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK=1` 启用，可能产生积分费用；用量记录会显示实际计费模型，并保留客户端请求模型字段。
+- **软限流阶梯补上时间窗，冷却剩余时间不再写成「0 min」**（承接「连续失败要有时间窗」那条：当时只修了 `fails` / `degrade`，两条软限流阶梯漏了）：
+  - `soft_streak` / `unscoped_streak` 也按 `WB_FAIL_WINDOW`（默认 600 秒）判定「连续」：它们以前只加不减、只有成功才归零，于是昨天被限过 3 次，今天第一个 429 就直接从 2400s 起步（模型档 240s），后天更高，一路顶到 7200s——账号早就恢复正常（面板测试是绿的），却动不动被按几十分钟到两小时。
+  - `unavailable_reason()` 的剩余时间改成秒级（`_human_left()`）：还剩 42 秒时以前写「剩余 0 min」，读起来像「早该能用了、网关还挡着」；现在写「剩余 42s」，连续第 2 次起附上「（连续第 N 次）」，看得出是在升级还是刚开始。
+  - 通用失败分支（非 429 / 403 / 402 / 5xx / 传输抖动）以前**静默**给账号记一笔并冷却 3/60 秒：池子空了的报错只说得清谁在冷却，说不清是谁把它记成冷却的。现在打一行 `account <uid>: <异常原文>, cooling Ns (fails=…, ready=…)`。
+  - `tests/_test_breaker_fairness.py` 扩到 27 项（两条阶梯的窗口衰减、`WB_FAIL_WINDOW=0` 的旧语义、剩余时间格式，以及「这条静默分支必须留日志」）。
+- 支持**按账号禁用个别模型**（账号 × 模型黑名单）：账号新增持久化字段 `disabledModels`，面板账号行点「+ 禁用模型」会弹出该账号所属区域的模型复选框列表（**默认全选；取消勾选即禁用**，带全选 / 全不选与实时计数），也可直接 `POST /accounts/set` 传 `disabledModels`（空数组 = 清空）。命中的模型不再派给该账号，请求自动落到池子里其他账号；该账号的其他模型完全不受影响。默认空 = 不限制、行为不变。仅**精确匹配**模型 id（不做前缀）。这是**人工**配置，与 `model_caps` / `model_cooldowns` 那些自动节流互不干扰；池子里所有账号都禁用了某个模型时，报错会逐个账号写明原因。
+- 请求日志与看板「最近请求」表显示发起方 API Key：`chat:` / `chat done:` / `messages:` / `responses:` 四条日志行，以及「最近请求」表格新增的一列，都会带上该次请求所用 key 的名字（没填 name 就回退 id）；未带 key 的记录显示 `-` / `—`。纯显示层改动——`usage.jsonl` 里的 `key` 字段仍是 key id，「按 API Key 的消耗归属」的统计口径不变。
+
+## v1.7.10
+
+协议与并发控制重大增强（修复与发布）：系统设置新增「启用 Anthropic Messages 接口 (Claude)」与「免费额度耗尽回退积分版」两个可视化开关，默认关闭；支持为每个 API Key 配置独立最大并发数（#359）；一键配置 DeepSeek Harness 默认开启视觉识图能力（#385）；修复流式 finish_reason: error 被误记为成功的问题（#389）；修复类内方法缩进保证全量套件全绿。
+
+- **系统设置支持可视化开关 Anthropic Messages 接口 (Claude)**：用户知晓协议转换长上下文可能增加积分消耗的风险后，可直接在控制台勾选启用，无需再配置环境变量并重启。
+- **系统设置支持可视化开关免费额度耗尽回退积分版**（#387）：国际版 deepseek-v4.1-flash 全池 6004 撞线后可选回退到 deepseek-v4.1-flash-sg，支持面板可视化一键开关，默认关闭防误耗积分。
+- **支持为每个 API Key 配置独立并发限制**（#359）：编辑 Key 时支持设置最大并发数（0 或留空 = 不限并发），并在卡片展示「并发上限 N」徽章，请求层实时计数并在超限时返回 429。
+- **一键配置写入 DeepSeek Harness 默认开启识图**（#385）：为多模态模型自动配置 supportsVision: true。
+- **修复流式 finish_reason=error 记账统计不实**（#389）：上游流内返回 error 时如实调用 record_error 记录失败，避免看板成功率虚高。
+
+## v1.7.9
+
+协议与并发控制重大增强：系统设置新增「启用 Anthropic Messages 接口 (Claude)」与「免费额度耗尽回退积分版」两个可视化开关，默认关闭；支持为每个 API Key 配置独立最大并发数（#359）；一键配置 DeepSeek Harness 默认开启视觉识图能力（#385）；修复流式 finish_reason: error 被误记为成功的问题（#389）。
+
+- **系统设置支持可视化开关 Anthropic Messages 接口 (Claude)**：用户知晓协议转换长上下文可能增加积分消耗的风险后，可直接在控制台勾选启用，无需再配置环境变量并重启。
+- **系统设置支持可视化开关免费额度耗尽回退积分版**（#387）：国际版 deepseek-v4.1-flash 全池 6004 撞线后可选回退到 deepseek-v4.1-flash-sg，支持面板可视化一键开关，默认关闭防误耗积分。
+- **支持为每个 API Key 配置独立并发限制**（#359）：编辑 Key 时支持设置最大并发数（0 或留空 = 不限并发），并在卡片展示「并发上限 N」徽章，请求层实时计数并在超限时返回 429。
+- **一键配置写入 DeepSeek Harness 默认开启识图**（#385）：为多模态模型自动配置 supportsVision: true。
+- **修复流式 finish_reason=error 记账统计不实**（#389）：上游流内返回 error 时如实调用 record_error 记录失败，避免看板成功率虚高。
+
+## v1.7.8
+
+打卡鲁棒性与下游聚合规范对齐：每日活跃打卡支持在首选模型额度用满（6004 cap）或限流（429 冷却）时自动回退同区域备选免费模型，确保任务永不中断（#341）；严格对齐下游聚合器（New API / One API）缓存解析规范，流式尾包与非流式返回强制补齐并透传 prompt_tokens_details.cached_tokens（#370）。
+
+- **每日活跃打卡自动防冷却回退**（#341）：在 `daily_chat_model()` 中增加冷却感知机制，若当前账号的 `deepseek-v4.1-flash` 处于 429 冷却或 6004 额度耗尽状态，自动顺延回退至该区域可用的备选免费模型（如 `hy3`、`hy4-preview`、`glm-5.3-flash` 等），避免单一模型耗尽导致当天 30/50 活跃奖励丢失。
+- **下游聚合器缓存命中规范对齐**（#370）：针对 New API / One API 严格依赖 `usage.prompt_tokens_details.cached_tokens` 的解析行为，在网关响应清洗层无论流式还是非流式均规范化补齐该字段，确保下游能正确呈现缓存命中绿色标识与 Token 统计。
+
+## v1.7.7
+
+渠道校验对齐与稳定性提升：对齐国际版 5.8.4 客户端出站身份头与链路追踪头族，彻底解决上游 11-128 conversation id missing 拦截（#380、#382）；熔断机制引入时间窗与本机断网识别，新增账号池一键连通性测试（#375）；任务福利页新增「未活跃账号一键打卡」与悬停预览（#379）；国际版每日活跃网页通道支持失败自动阶梯重试（#377）；禁用总览区分配额耗尽与临时限流（#376）；一键配置 DeepSeek Harness 补全思考档位（#374、#378）；修复 413 请求体超限 gateway_hint 提示（#372）与 GPT 家族 max_tokens < 16 自动夹取保护（#364、#252）。
+
+- **任务与福利页新增「未活跃打卡一键打卡」**：「国际版每日活跃福利」区在「每日活跃打卡 (国际版)」右边多一个按钮，只对**今天还没有活跃打卡记录**的国际版启用账号补跑。判定口径与「今日活跃打卡状态」卡片完全一致（都走 `activityStatusOf()`），所以不会把已经打过的账号再打一遍——重复打卡不给积分，只会白烧账号额度；一个待打卡的都没有时只提示、不发请求。服务端 `POST /accounts/daily-chat` 新增 `uids` 参数按名单精确执行，名单里混进的停用账号、其它区域账号或不存在的 uid 一律忽略；**空名单等于「一个都不打」**，不会回落成「全部账号」（要打全部就别传 `uids`）。
+- **「今日活跃打卡状态」卡片悬停可看未打卡名单**：鼠标放在卡片上会列出今天还没打卡的账号昵称与数量，不用再去账号页一个个比对；这份名单就是上面那个按钮要打的那批，看到什么就打什么。
+- 新增 `tests/_test_daily_chat_pending.js`（22 项，按钮位置/样式、名单同源、请求体只带未打卡 uid、空名单与无国际账号的边界）与 `tests/_test_daily_chat_pending_route.py`（6 项，服务端 `uids` 过滤与空名单语义）。
+- **熔断不再乱开：连续失败要有时间窗，本机断网也不算账号的账**。两个现象同源——账号治理只看次数、不看间隔，也不区分「这是谁的问题」：
+  - `fails` 以前只加不减（只有成功才归零）：几小时前的一次 502 + 昨天的一次超时 + 刚才一次抖动就能凑成「连续 3 次」，把账号关 30 分钟；下一个窗口还按 1800 → 3600 → 7200… 翻倍，于是越关越久——「明明测了能用，它还熔断」就是这么来的。现在两次失败间隔超过 `WB_FAIL_WINDOW`（默认 600 秒，设 0 关闭）就重新从 1 数起，成功照旧清零。
+  - DNS 解析不了、路由不可达这类**本机没网**的失败，以前也逐账号记一笔并冷却 60 秒；断网那一分钟里整个池子被走一遍，等网络恢复，账号全在冷却里。现在这类失败先被认出来（`looks_like_local_network()`），一个账号都不记，按「本机网络不可用」上报并给出 `gateway_hint`；`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条链路都走这个分支。
+  - 账号行与禁用总览新增可解释字段：连续失败次数、窗口长度与最近一次失败距今（`fails` / `failWindow` / `lastFailFor`），「还差几次熔断」一眼可见。
+- **新增「一键测试」**：工具栏按钮一次测完当前区域所有已启用账号，并同时给出「本机 ↔ 上游」的连通性（DNS 与 TCP 耗时）。结果表逐账号显示通过 / 失败、耗时与原因（失败行附带「连续失败 N 次」），**本机断网的行单独标成「本机网络」**，不会和账号真失败混在一起。测试通过会清掉该账号的熔断 / 降权 / 软限流计数（沿用 `/accounts/test` 的成功路径）；测试失败只记录原因、不冷却账号——诊断动作不该改变账号状态。后端不带 `uid` 即为整池测试：`POST /accounts/test {"realm": "cn"}`。
+- 新增 `tests/_test_breaker_fairness.py`（19 项）与 `tests/_test_account_test_all.js`（27 项）；看板套件新增共享的 `tests/_dashboard_sandbox.js`（把页面脚本装进显式沙箱再跑，本套件用它；其它看板套件仍各自 `new Function`，可后续统一）。
+- **禁用总览如实区分「配额耗尽」与「临时限流」**：面板「当前禁用」页把模型级限流一律写成「该模型配额耗尽（code 6004）」，但其中多数只是上游一次 429 临时限流（60s~10m 的短窗口，到点自动恢复）。现在按上游返回体里是否带重置墙钟（`cappedAt`）分开措辞：带的是 6004 配额耗尽，不带的是 429 临时限流，与账号卡片上的口径一致。
+- **禁用总览的时间列给出真实起始时刻**：模型级限流以前只在 6004 撞线时才有时间（列头「撞线时间」），临时 429 那一行永远是个「—」。现在网关把每次模型级限流的**发生时刻**一并记下并在 `/accounts` 的 `modelCooldowns[]` 里以 `startedAt` 透出，列头改为中性的「开始时间」——6004 行给上游撞线时刻，429 行给限流时刻，两类都有「起始 + 恢复」两段真实时间（`startedAt` 为运行时态，重启即清零；6004 的撞线时刻另有持久化兜底）。
+- **国际版每日活跃网页通道失败重试**：网页通道一轮没跑完（会话状态仍是 `working`）时，原来直接判失败、当天 30/50 积分静默丢掉。现在**默认开启**失败重试，设置页「国际版每日活跃打卡」可调「最多尝试次数」（默认 3 次，含第一轮，上限 5）与「首轮等待」秒数（默认 120，上限 3600），也可以整个关掉。第 N 轮的等待是首轮的 2 倍（默认 3 次 = 120 / 240 / 480 秒）。建会话被业务拒绝（非 0 code）不再试，只有网络/5xx/408/429、沙箱未就绪、会话超时这类瞬时失败才继续；成功与失败说明都会写明实际试了几轮。
+
+## v1.7.6
+
+积分防护与客户端后台流量控制安全更新：针对桌面客户端内置路由悄悄调用硬编码付费模型消耗积分的问题，引入后台模型透明改写重定向；针对 Anthropic Messages 协议转换层在长上下文下可能存在的缓存复用异常与积分剧烈消耗风险，将该入口调整为默认禁用（安全闭环），仅保留显式环境变量选择启用（#363、#369）。
+
+- **桌面客户端后台模型重定向（免费替代）**（#363）：桌面客户端（如 Codex 等）内置路由将记忆生成、环境分析、自动化等后台任务硬编码发往 `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.3-codex` 等付费模型，UI 选择免费模型亦无法控制。网关在 POST 全局分发入口（选账号前）拦截名单内的后台模型并原子重定向至 `WB_BACKGROUND_MODEL_TARGET`（默认 `deepseek-v4.1-flash`），其余请求体原样透传并记录审计日志；支持环境变量自定义名单或置空禁用。
+- **Anthropic Messages 接口默认禁用与安全闭环**（#369）：鉴于协议转换层未向 WorkBuddy 上游透传 `cache_control`，在长上下文会话（如 Claude Code）中容易出现缓存失效率高、剧烈消耗积分的问题（#367），暂时对 `/v1/messages`、`/messages` 及计数端点采取安全策略——默认直接返回 HTTP 400（`invalid_request_error`）拒绝调用并阻止转发上游；知晓风险的用户可通过显式设置 `WB_ENABLE_ANTHROPIC_MESSAGES=1` 开启。
+- **套件与稳定性验证**：新增 `tests/_test_background_model_alias.py`（7 项专项测试），更新 `tests/_test_anthropic_http.py` 回归覆盖默认拦截与显式启用路径；套件总数由 148 扩充至 149（110 Python + 39 JS）。
+
 ## v1.7.5
 
 全新数据看板与设计升级：数据看板页全面重构为现代化 Bento 布局并换装 Claude 暖色调主题；网关模型清单重磅升级——新增手动「刷新模型清单」按钮（POST /catalog/refresh）与每日自动 API 获取兜底，模型列表扩展为 8 列（新增官方名称、采样参数与思考注记）并配备数据来源警示横幅与原始目录存档（catalog/）；首页价格卡片改造为优先显示实际积分消耗并附带公网估算价值（#358）。

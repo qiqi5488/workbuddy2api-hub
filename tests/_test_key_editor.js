@@ -30,8 +30,11 @@ function mkEl(id){
   return {
     id, innerHTML: '', textContent: '', value: '', checked: false,
     attrs: {},
-    classList: { add(){}, remove(){}, contains(){ return false; } },
-    style: {}, children: [], _boxes: [],
+    classList: { add(){}, remove(){}, contains(){ return false; }, toggle(){} },
+    // The panel sets CSS custom properties on <html> while it boots (theme,
+    // language); a bare {} would throw before the picker is even built.
+    style: { setProperty(){}, removeProperty(){}, getPropertyValue(){ return ''; } },
+    children: [], _boxes: [],
     focus(){}, blur(){}, click(){},
     appendChild(c){ this.children.push(c); },
     querySelectorAll(sel){ return sel && sel.indexOf('checkbox') !== -1 ? this._boxes : []; },

@@ -191,8 +191,11 @@ os.makedirs(store)
 # key_usage.json seeds the counter so the boundary is testable without a real
 # upstream: CAPPED has spent 600 of a 500 limit (already over); BELOW has spent
 # 100 of 500 (still under).
+# The Anthropic Messages route ships disabled by default since v1.7.6, and this
+# suite checks the cap on all three chat routes - so the store the gateway is
+# pointed at has to have the route on.
 with open(os.path.join(store, "settings.json"), "w", encoding="utf-8") as fh:
-    json.dump({"api_keys": [
+    json.dump({"enable_anthropic_messages": True, "api_keys": [
         {"id": "capped", "name": "限流Key", "key": "KEYCAPPED",
          "token_limit": 500, "enabled": True},
         {"id": "below", "name": "未满Key", "key": "KEYBELOW",
