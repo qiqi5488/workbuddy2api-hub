@@ -1716,6 +1716,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '已为': 'Set to',
     '已保存': 'Saved',
     '已停用': 'Disabled',
+    '已停用 · 任务中': 'Disabled · tasks on',
     '已全部停用所有账号': 'All accounts disabled',
     '已把全部账号的出站身份切换为 ': 'Switched the outbound identity of ALL accounts to ',
     '已全部启用所有账号': 'All accounts enabled',
@@ -2415,6 +2416,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '账号存储目录': 'Account directory',
     '账号已停用': 'Account disabled',
     '账号已成功启用': 'Account enabled',
+    '该账号已参与任务': 'Tasks enabled for this account',
+    '该账号已停止任务': 'Tasks disabled for this account',
+    '任务开': 'Tasks on',
+    '任务关': 'Tasks off',
     '账号当日消耗的 token 达到该值后暂停接单，请求自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示不限（不限额）；与「保留积分」各自独立，任一命中都会暂停接单。': 'Once the token use of an account for the day reaches this, it stops taking orders and requests switch to other accounts; it recovers after local midnight. 0 means no limit; it is independent of Reserved credits, and either one pauses order taking.',
     '账号当日消费的积分达到该值后，只允许请求免费模型（目录中标记为 x0.00 的模型），需要花费积分的模型自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示关闭（默认）。': 'Once the credit spend of an account for the day reaches this, only free models are allowed (those marked x0.00 in the catalog) and models that cost credits switch to other accounts; it recovers after local midnight. 0 turns it off (default).',
     '账号，之后相关请求都会走该账号': 'account; requests will then go through it',
@@ -2574,6 +2579,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '价格刷新未运行': 'Price refresh is not running',
     '未找到可用的国内版账号': 'No usable China account found',
     '未找到已启用的国内版账号': 'No enabled China account found',
+    '未找到参与任务的国内版账号': 'No task-enabled China account found',
     '未找到指定的国内版账号': 'No matching China account found',
     '已从桌面客户端进程回收密钥（只留在内存里）': 'Key recovered from the desktop client process (kept in memory only)',
     '查询失败': 'lookup failed',
@@ -6423,13 +6429,19 @@ async function switchGrowthAccount(uid){
   await loadGrowthTasks();
 }
 
+/* Task participation: `tasksEnabled` is authoritative; older gateways do
+ * not send it, so fall back to `enabled`. */
+function taskActive(a){
+  return !!a && (a.tasksEnabled !== undefined ? !!a.tasksEnabled : !!a.enabled);
+}
+
 async function loadIntlTasks(){
   try{
     const [r, g] = await Promise.all([
       getJSON('/accounts?realm=all'),
       getJSON('/accounts/credits/grants').catch(() => ({}))
     ]);
-    const accts = (r.accounts || []).filter(a => a.realm === 'intl' && a.enabled);
+    const accts = (r.accounts || []).filter(a => a.realm === 'intl' && taskActive(a));
     const countEl = document.getElementById("intlAcctCount");
     if(countEl) countEl.textContent = accts.length + ' 个';
     const bonusEl = document.getElementById("intlBonusCredits");
@@ -6783,7 +6795,7 @@ async function doDailyChat(btn){
  * （都用 activityStatusOf()），所以卡片上悬停看到的未打卡名单，就是下面按钮要打的那批。 */
 function pendingDailyChatAccounts(){
   const all = window.ACCOUNTS || [];
-  return all.filter(a => a.realm === 'intl' && a.enabled).filter(a => {
+  return all.filter(a => a.realm === 'intl' && taskActive(a)).filter(a => {
     const s = activityStatusOf(a);
     return !(s.kind === 'ok' || s.kind === 'done');
   });
@@ -7811,7 +7823,7 @@ function updateTaskPageCheckinCards(){
       stateEl.title = tip;
       if(intlCard) intlCard.title = tip;
     };
-    const intlAccts = allList.filter(a => a.realm === 'intl' && a.enabled);
+    const intlAccts = allList.filter(a => a.realm === 'intl' && taskActive(a));
     if(!intlAccts.length){
       stateEl.textContent = '无国际账号';
       setCardTip('');
@@ -7836,7 +7848,7 @@ function updateTaskPageCheckinCards(){
 
   const chkStateEl = document.getElementById("cnTodayCheckinState");
   if(chkStateEl){
-    let targetAccts = allList.filter(a => a.realm === 'cn' && a.enabled);
+    let targetAccts = allList.filter(a => a.realm === 'cn' && taskActive(a));
     if(typeof CURRENT_GROWTH_UID !== 'undefined' && CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
       targetAccts = targetAccts.filter(a => a.uid === CURRENT_GROWTH_UID);
     }
@@ -7984,7 +7996,10 @@ function accountRow(a){
   const nameAttr = esc(String(a.nickname || '').replace(/["'\\<>]/g, ''));
   const usage = USAGE_BY_ACCOUNT[a.uid] || {};
   const isTokenBad = !!(a.tokenExpired || a.expiresIn === 'expired');
-  const state = !a.enabled ? '<span class="badge off">已停用</span>'
+  const state = !a.enabled
+              ? (a.tasksEnabled
+                 ? '<span class="badge off" title="不接 API 流量，但仍参与签到 / 任务">已停用 · 任务中</span>'
+                 : '<span class="badge off">已停用</span>')
               : isTokenBad ? '<span class="badge bad" title="登录凭证已失效（上游返回 401 或已过期），请重新登录">凭证失效</span>'
               : a.reserveBlocked ? '<span class="badge warn">保留积分</span>'
               : a.dailyLimitBlocked ? '<span class="badge warn" title="今日已用 ' + fmt(a.dailyTokensToday || 0) + ' / ' + fmt(a.dailyTokenLimit || 0) + ' token，暂停接单（本地 0 点恢复）">日限额</span>'
@@ -8070,6 +8085,7 @@ function accountRow(a){
     +     (a.note
           ? '<span class="note-chip has" title="点击编辑备注" onclick="editAccountNote(&quot;' + uidAttr + '&quot;)">' + esc(a.note) + '</span>'
           : '<span class="note-chip" title="点击添加备注，比如「批量」/「自用」" onclick="editAccountNote(&quot;' + uidAttr + '&quot;)">+ 备注</span>')
+    +     '<span class="badge mini ' + (a.tasksEnabled ? 'ok' : 'off') + '" style="cursor:pointer;margin-left:6px" title="参与签到 / 成长任务 / 连登管家 / 猫猫旅行 / 国际版活跃；与 API 取号无关，点一下切换" onclick="toggleAccountTasks(&quot;' + uidAttr + '&quot;,' + (!a.tasksEnabled) + ')">任务' + (a.tasksEnabled ? '开' : '关') + '</span>'
     // 移动端专用：版本 + 状态徽章靠右同行（桌面隐藏，用表格自己的两列）。
     +     '<span class="acct-mobile-badges">' + realmBadgeMobile + state + '</span>'
     +   '</div>'
@@ -8538,6 +8554,16 @@ async function toggleAccount(uid, enable, btn){
     if(btn) btn.disabled = false;
   }
 }
+async function toggleAccountTasks(uid, enable){
+  try{
+    await postJSON('/accounts/set', {uid: uid, tasksEnabled: enable});
+    await loadAccounts();
+    toast(enable ? '该账号已参与任务' : '该账号已停止任务', 'ok');
+  }catch(e){
+    toast('操作失败: ' + e.message, 'bad');
+  }
+}
+
 async function setAccountWeight(uid, weight, sel){
   if(sel) sel.disabled = true;
   try{

@@ -10264,7 +10264,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.21",
+        "version": "1.7.24",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -17664,7 +17664,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.21"
+    server_version = "wb-proxy/1.7.24"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -18726,9 +18726,9 @@ class Handler(BaseHTTPRequestHandler):
     def _get_tasks(self, query):
         if not self._authorized():
             return
-        cn_accounts = [a for a in (POOL.accounts if POOL else []) if a.realm == "cn" and a.enabled]
+        cn_accounts = POOL.task_accounts("cn") if POOL else []
         if not cn_accounts:
-            return self._json_panel(200, {"tasks": [], "summary": {}, "accounts": [], "msg": "未找到可用的国内版账号"})
+            return self._json_panel(200, {"tasks": [], "summary": {}, "accounts": [], "msg": "未找到参与任务的国内版账号"})
         uid = (query.get("uid") or [None])[0]
         acc = None
         if uid and uid != "all":
@@ -20309,9 +20309,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
             targets = [target]
         else:
-            targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
+            targets = POOL.task_accounts("cn")
         if not targets:
-            return self._json_panel(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
+            return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
         claim = payload.get("claim", True) is not False
         combined_logs = []
@@ -20370,9 +20370,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
             targets = [target]
         else:
-            targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
+            targets = POOL.task_accounts("cn")
         if not targets:
-            return self._json_panel(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
+            return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_streak_bonus
         results = []
         for i, acc in enumerate(targets):
@@ -20396,9 +20396,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
             targets = [target]
         else:
-            targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
+            targets = POOL.task_accounts("cn")
         if not targets:
-            return self._json_panel(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
+            return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import do_cat_travel
         results = []
         for i, acc in enumerate(targets):
@@ -20451,8 +20451,12 @@ class Handler(BaseHTTPRequestHandler):
         if not status.get("latest_tag") or not status.get("release_url"):
             return self._json(409, {"ok": False, "msg": "请先点击立即检查更新"})
         try:
+            host = self.server.server_address[0]
+            lan = host not in ("127.0.0.1", "::1", "localhost")
             queued = wb_update_request.request_install(
-                status["latest_tag"], status["current_version"])
+                status["latest_tag"], status["current_version"],
+                port=self.server.server_port, lan=lan,
+                repo=wb_updates.configured_repository())
         except wb_update_request.UpdateRequestError as exc:
             return self._json(409, {"ok": False, "msg": str(exc)})
         queued["ok"] = True
@@ -20605,9 +20609,9 @@ class Handler(BaseHTTPRequestHandler):
             # 「全部账号」——那正好和这个按钮要的效果相反。要打全部就别传 uids。
             wanted = {str(item) for item in uids if item}
             targets = [a for a in POOL.accounts
-                       if a.realm == "intl" and a.enabled and str(a.uid) in wanted]
+                       if a.realm == "intl" and a.task_active() and str(a.uid) in wanted]
         else:
-            targets = [a for a in POOL.accounts if a.realm == "intl" and a.enabled]
+            targets = POOL.task_accounts("intl")
         results = []
         for account in targets:
             if account is None:
@@ -20631,7 +20635,7 @@ class Handler(BaseHTTPRequestHandler):
         if uid:
             targets = [POOL.get(uid)]
         else:
-            targets = [a for a in POOL.accounts if a.realm == "intl" and a.enabled]
+            targets = POOL.task_accounts("intl")
         results = []
         for account in targets:
             if account is None:
@@ -20856,6 +20860,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(404, "no such account")
             log("account %s %s"
                 % (uid[:8], "enabled" if payload.get("enabled") else "disabled"))
+        if "tasksEnabled" in payload:
+            updated = POOL.set_tasks_enabled(uid, bool(payload.get("tasksEnabled")))
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s tasks %s"
+                % (uid[:8], "enabled" if payload.get("tasksEnabled") else "disabled"))
         if "weight" in payload:
             try:
                 weight = int(payload.get("weight"))
@@ -20885,7 +20895,8 @@ class Handler(BaseHTTPRequestHandler):
         if updated is None:
             return self._error(
                 400,
-                "nothing to update: pass 'enabled', 'proxy', 'proxySlot', 'weight' or 'note'"
+                "nothing to update: pass 'enabled', 'tasksEnabled', 'proxy', "
+                "'proxySlot', 'weight' or 'note'"
             )
         return self._json_panel(200, {"account": updated})
 
