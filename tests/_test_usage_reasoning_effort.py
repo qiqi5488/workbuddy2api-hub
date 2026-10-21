@@ -20,6 +20,15 @@ os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
 os.environ["WB_PROXY_USAGE_DIR"] = _TMP
 os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
 
+# Upstream's effort mapping (on by default since v1.7.19) rewrites a level the
+# model does not accept to that model's own default before the request leaves,
+# so the level that actually runs is the mapped one. These assertions are about
+# which of two sources wins - the request's own value or the catalog pin - so
+# the mapping is switched off here to keep the two separable.
+with open(os.path.join(os.environ["ACCOUNTS_DIR"], "settings.json"), "w",
+          encoding="utf-8") as fh:
+    json.dump({"reasoning_effort_map": False}, fh)
+
 import wb_accounts
 import wb_proxy as P
 

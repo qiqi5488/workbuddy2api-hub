@@ -144,7 +144,10 @@ os.makedirs(store)
 with open(os.path.join(store, "settings.json"), "w", encoding="utf-8") as fh:
     # The Anthropic Messages route ships disabled by default since v1.7.6, and
     # this suite checks the per-key model gate on all three chat routes.
-    json.dump({"enable_anthropic_messages": True, "api_keys": [
+    # /v1/models key filtering became opt-in upstream (#473); section [4] still
+    # pins it, so the store turns it on.
+    json.dump({"enable_anthropic_messages": True,
+               "filter_models_by_key": True, "api_keys": [
         {"id": "k1", "name": "restricted", "key": "KEYRESTRICTED",
          "models": ["deepseek-v4.1-flash"], "enabled": True},
         {"id": "k2", "name": "open", "key": "KEYOPEN", "enabled": True},
