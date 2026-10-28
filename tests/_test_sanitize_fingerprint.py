@@ -209,6 +209,75 @@ class DshGuiParagraphTests(unittest.TestCase):
         self.assertIn("whose URL is named in the runtime context", system)
 
 
+class DshPathGuidanceTests(unittest.TestCase):
+    """DSH 默认路径说明的连续两句触发 11128，拆开发送则正常。"""
+
+    FIRST = "Tokens prefixed with @ are paths the user explicitly referenced."
+    SECOND = ("Relative paths resolve from the workspace root; absolute paths "
+              "identify files or directories on the host.")
+    CLEAN = "Tokens starting with @ are paths the user explicitly referenced."
+    PAIR = FIRST + " " + SECOND
+
+    def test_paragraph_reworded_without_losing_path_rules(self):
+        suffix = (' A trailing slash marks a directory: list it when its contents matter. '
+                  '@"..." quotes a path containing spaces.')
+        self.assertEqual(P.sanitize_text(self.PAIR + suffix),
+                         self.CLEAN + " " + self.SECOND + suffix)
+
+    def test_individually_accepted_sentences_untouched(self):
+        for text in (self.FIRST, self.SECOND,
+                     self.FIRST + " Relative paths may use another root."):
+            with self.subTest(text=text):
+                self.assertEqual(P.sanitize_text(text), text)
+                self.assertFalse(P.has_fingerprint(text))
+
+    def test_case_insensitive_and_idempotent(self):
+        for text in (self.PAIR.lower(), self.PAIR.upper(), self.PAIR):
+            with self.subTest(text=text):
+                self.assertTrue(P.has_fingerprint(text))
+                clean = P.sanitize_text(text)
+                self.assertEqual(clean, self.CLEAN + text[len(self.FIRST):])
+                self.assertEqual(P.sanitize_text(clean), clean)
+                self.assertFalse(P.has_fingerprint(clean))
+
+    def test_scoped_to_instruction_roles(self):
+        roles = ("system", "developer", "assistant", "user", "tool", "function")
+        out = P.sanitize_messages([{"role": role, "content": self.PAIR}
+                                   for role in roles])
+        for role, message in zip(roles, out):
+            with self.subTest(role=role):
+                expected = (self.CLEAN + " " + self.SECOND
+                            if role in ("system", "developer", "assistant")
+                            else self.PAIR)
+                self.assertEqual(message["content"], expected)
+
+    def test_content_parts_preserve_images(self):
+        image = {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+        content = [{"type": "text", "text": self.PAIR}, image]
+        out = P.sanitize_messages([{"role": "system", "content": content}])
+        self.assertEqual(out[0]["content"][0]["text"], self.CLEAN + " " + self.SECOND)
+        self.assertEqual(out[0]["content"][1], image)
+        self.assertEqual(content[0]["text"], self.PAIR)
+
+    def test_wire_body_keeps_user_and_tool_data(self):
+        args = json.dumps({"text": self.PAIR})
+        body = P.build_upstream_body({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                {"role": "system", "content": self.PAIR},
+                {"role": "user", "content": self.PAIR},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_path", "type": "function",
+                    "function": {"name": "check_path", "arguments": args}}]},
+                {"role": "tool", "tool_call_id": "call_path", "content": self.PAIR},
+            ]})
+        messages = body["messages"]
+        self.assertEqual(messages[0]["content"], self.CLEAN + " " + self.SECOND)
+        self.assertEqual(messages[1]["content"], self.PAIR)
+        self.assertEqual(messages[2]["tool_calls"][0]["function"]["arguments"], args)
+        self.assertEqual(messages[3]["content"], self.PAIR)
+
+
 class AssistantHistoryFingerprintTests(unittest.TestCase):
     """#574：assistant 历史里的身份句 / 品牌 + GUI 组合。
 

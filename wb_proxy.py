@@ -11905,6 +11905,15 @@ SANITIZE_DSH_GUI_RE = re.compile(
     r" whose URL the runtime context names\.")
 SANITIZE_DSH_GUI_REPLACEMENT = r"\1 whose URL is named in the runtime context."
 SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
+# DSH 的路径说明前两句连续出现也会触发 11128；任一句单独出现都放行。
+# 只在完整第二句紧随时改首句的同义短语，保留路径规则与用户数据。
+SANITIZE_DSH_PATH_RE = re.compile(
+    r"Tokens prefixed with @ are paths the user explicitly referenced\."
+    r"(?= Relative paths resolve from the workspace root; absolute paths "
+    r"identify files or directories on the host\.)", re.IGNORECASE)
+SANITIZE_DSH_PATH_LOWER = "tokens prefixed with @ are paths the user explicitly referenced."
+SANITIZE_DSH_PATH_REPLACEMENT = (
+    "Tokens starting with @ are paths the user explicitly referenced.")
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -11962,6 +11971,9 @@ def has_fingerprint(text, identity=True):
     if (SANITIZE_DSH_GUI_LOWER in low
             and SANITIZE_DSH_GUI_RE.search(text) is not None):
         return True
+    if (SANITIZE_DSH_PATH_LOWER in low
+            and SANITIZE_DSH_PATH_RE.search(text) is not None):
+        return True
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
     # 清洗步骤，也不会白白改写。
@@ -11982,6 +11994,7 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
+        text = SANITIZE_DSH_PATH_RE.sub(SANITIZE_DSH_PATH_REPLACEMENT, text)
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
