@@ -123,6 +123,135 @@ class SettingsContractTests(unittest.TestCase):
                 wb_settings.save(d, {"update_check_enabled": value})
                 self.assertFalse(wb_settings.update_check_enabled(d), value)
 
+    def test_update_check_proxy_slot_round_trip_and_empty_clears(self):
+        with tempfile.TemporaryDirectory(prefix="upd-proxy-") as d:
+            wb_settings.set_proxy_slots(d, [
+                {"id": "slot-1", "name": "Tokyo", "url": "http://127.0.0.1:7890"},
+            ])
+            self.assertEqual(wb_settings.update_check_proxy_slot(d), "")
+            wb_settings.set_update_check_proxy_slot(d, "slot-1")
+            self.assertEqual(wb_settings.update_check_proxy_slot(d), "slot-1")
+            with mock.patch.object(proxy, "ACCOUNTS_DIR", d):
+                view = proxy.runtime_settings_view()
+            self.assertEqual(view["update_check_proxy_slot"], "slot-1")
+            self.assertEqual(view["update_check_proxy_slots"],
+                             [{"id": "slot-1", "label": "Tokyo", "enabled": True}])
+            wb_settings.set_update_check_proxy_slot(
+                d, wb_settings.UPDATE_CHECK_PROXY_SYSTEM)
+            self.assertEqual(wb_settings.update_check_proxy_slot(d),
+                             wb_settings.UPDATE_CHECK_PROXY_SYSTEM)
+            wb_settings.set_update_check_proxy_slot(d, "")
+            self.assertEqual(wb_settings.update_check_proxy_slot(d), "")
+            with open(wb_settings.settings_path(d), encoding="utf-8") as fh:
+                self.assertNotIn("update_check_proxy_slot", json.load(fh))
+
+
+class UpdateProxyTests(unittest.TestCase):
+    def _checker(self, directory):
+        return wb_updates.UpdateChecker(
+            current_version=CURRENT, settings_dir=directory, fetcher=None,
+            first_delay=0, poll_seconds=0.01)
+
+    def test_a_proxy_slot_routes_the_real_fetcher(self):
+        with tempfile.TemporaryDirectory(prefix="upd-proxy-") as d:
+            wb_settings.set_proxy_slots(d, [
+                {"id": "slot-1", "name": "Tokyo", "url": "http://127.0.0.1:7890"},
+            ])
+            wb_settings.set_update_check_proxy_slot(d, "slot-1")
+            seen = []
+
+            class Opener(object):
+                def open(self, request, timeout=None):
+                    seen.append((request.full_url, timeout))
+                    return io.BytesIO(json.dumps([release("v1.6.20")]).encode("utf-8"))
+
+            def opener(proxy_url=""):
+                seen.append(("opener", proxy_url))
+                return Opener()
+
+            with mock.patch.object(wb_updates, "_opener", opener):
+                status = self._checker(d).check(manual=True)
+            self.assertEqual(status["last_error"], "")
+            self.assertEqual(status["latest_version"], "1.6.20")
+            self.assertEqual(seen[0], ("opener", "http://127.0.0.1:7890"))
+
+    def test_a_disabled_or_deleted_slot_falls_back_to_direct(self):
+        for slots, slot_id in (
+            ([{"id": "slot-1", "url": "http://127.0.0.1:7890", "enabled": False}], "slot-1"),
+            ([], "slot-1"),
+        ):
+            with self.subTest(slot_id=slot_id):
+                with tempfile.TemporaryDirectory(prefix="upd-proxy-") as d:
+                    wb_settings.set_proxy_slots(d, slots)
+                    wb_settings.set_update_check_proxy_slot(d, slot_id)
+                    seen = []
+
+                    class Opener(object):
+                        def open(self, request, timeout=None):
+                            return io.BytesIO(json.dumps([release("v1.6.20")]).encode("utf-8"))
+
+                    def opener(proxy_url=""):
+                        seen.append(proxy_url)
+                        return Opener()
+
+                    with mock.patch.object(wb_updates, "_opener", opener):
+                        self._checker(d).check(manual=True)
+                    # A missing/disabled slot falls back to the explicit direct
+                    # opener, not urllib's proxy-discovering default opener.
+                    self.assertEqual(seen, [""])
+
+    def test_system_proxy_sentinel_routes_the_real_fetcher(self):
+        with tempfile.TemporaryDirectory(prefix="upd-proxy-") as d:
+            wb_settings.set_update_check_proxy_slot(
+                d, wb_settings.UPDATE_CHECK_PROXY_SYSTEM)
+            seen = []
+
+            class Opener(object):
+                def open(self, request, timeout=None):
+                    return io.BytesIO(
+                        json.dumps([release("v1.6.20")]).encode("utf-8"))
+
+            def opener(proxy_url=""):
+                seen.append(proxy_url)
+                return Opener()
+
+            with mock.patch.object(wb_updates, "_opener", opener):
+                status = self._checker(d).check(manual=True)
+            self.assertEqual(status["last_error"], "")
+            self.assertEqual(seen, [wb_settings.UPDATE_CHECK_PROXY_SYSTEM])
+
+    def test_direct_and_system_openers_have_distinct_proxy_discovery(self):
+        # System mode explicitly consumes the host's proxy discovery. Pin that
+        # lookup so the assertion stays deterministic on every test machine.
+        with mock.patch.object(wb_updates.urllib.request, "getproxies",
+                               return_value={"https": "http://127.0.0.1:7890"}):
+            discovered = wb_updates._opener(wb_settings.UPDATE_CHECK_PROXY_SYSTEM)
+        discovered_proxy = [h for h in discovered.handlers
+                            if isinstance(h, wb_updates.urllib.request.ProxyHandler)]
+        self.assertEqual(len(discovered_proxy), 1)
+        self.assertEqual(discovered_proxy[0].proxies,
+                         {"https": "http://127.0.0.1:7890"})
+        # Direct mode must never call proxy discovery, even when one exists.
+        with mock.patch.object(wb_updates.urllib.request, "getproxies",
+                               return_value={"https": "http://127.0.0.1:7890"}) as gp:
+            direct = wb_updates._opener("")
+        gp.assert_not_called()
+        # urllib omits an empty ProxyHandler from opener.handlers, so the
+        # meaningful direct-path assertion is that no proxy handler exists.
+        self.assertFalse(any(isinstance(h, wb_updates.urllib.request.ProxyHandler)
+                             for h in direct.handlers))
+
+    def test_proxy_credentials_never_reach_the_settings_view(self):
+        with tempfile.TemporaryDirectory(prefix="upd-proxy-") as d:
+            secret = "user:password"
+            wb_settings.set_proxy_slots(d, [
+                {"id": "slot-1", "name": "Auth", "url": "http://%s@127.0.0.1:7890" % secret},
+            ])
+            wb_settings.set_update_check_proxy_slot(d, "slot-1")
+            with mock.patch.object(proxy, "ACCOUNTS_DIR", d):
+                payload = json.dumps(proxy.runtime_settings_view())
+            self.assertNotIn(secret, payload)
+
 
 class VersionComparisonTests(unittest.TestCase):
     def test_plain_semver_parses_with_or_without_the_v(self):
@@ -486,24 +615,25 @@ class QuotaFallbackTests(unittest.TestCase):
     suites use sits above the fallback and cannot see it."""
 
     def _stub(self, web, api_error=None):
-        """urlopen stand-in: the API refuses, the web endpoint answers `web`."""
+        """Opener stand-in: the API refuses, the web endpoint answers `web`."""
         calls = []
 
-        def urlopen(request, timeout=None):
-            calls.append(request)
-            if request.full_url == wb_updates.RELEASES_URL:
-                raise api_error or urllib.error.HTTPError(
-                    request.full_url, 403, "rate limited", {}, None)
-            if isinstance(web, Exception):
-                raise web
-            return web
+        class Opener(object):
+            def open(self, request, timeout=None):
+                calls.append(request)
+                if request.full_url == wb_updates.RELEASES_URL:
+                    raise api_error or urllib.error.HTTPError(
+                        request.full_url, 403, "rate limited", {}, None)
+                if isinstance(web, Exception):
+                    raise web
+                return web
 
-        return urlopen, calls
+        return (lambda proxy="": Opener()), calls
 
     def test_an_api_quota_error_falls_back_to_the_web_endpoint(self):
         with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
-            urlopen, calls = self._stub(Redirected(tag_url("v1.6.20")))
-            with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+            opener, calls = self._stub(Redirected(tag_url("v1.6.20")))
+            with mock.patch.object(wb_updates, "_opener", opener):
                 status = checker(d, wb_updates.fetch_releases).check(manual=True)
             self.assertEqual(len(calls), 2, "the API goes first, the web endpoint second")
             self.assertEqual(status["last_error"], "")
@@ -515,17 +645,17 @@ class QuotaFallbackTests(unittest.TestCase):
         # A proxy can reset one host and serve the other, so the fallback must
         # not care *why* the API call failed.
         with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
-            urlopen, _calls = self._stub(Redirected(tag_url("v1.6.20")),
-                                         api_error=urllib.error.URLError("reset"))
-            with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+            opener, _calls = self._stub(Redirected(tag_url("v1.6.20")),
+                                        api_error=urllib.error.URLError("reset"))
+            with mock.patch.object(wb_updates, "_opener", opener):
                 status = checker(d, wb_updates.fetch_releases).check(manual=True)
             self.assertEqual(status["last_error"], "")
             self.assertEqual(status["latest_version"], "1.6.20")
 
     def test_a_failing_fallback_still_reports_the_api_cause(self):
         with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
-            urlopen, _calls = self._stub(urllib.error.URLError("no route"))
-            with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+            opener, _calls = self._stub(urllib.error.URLError("no route"))
+            with mock.patch.object(wb_updates, "_opener", opener):
                 status = checker(d, wb_updates.fetch_releases).check(manual=True)
             self.assertEqual(status["last_error"], "HTTP 403")
             self.assertIsNone(status["latest_version"])
@@ -534,13 +664,15 @@ class QuotaFallbackTests(unittest.TestCase):
         token = "ghp-not-a-real-token"
         sent = []
 
-        def urlopen(request, timeout=None):
-            sent.append(request.get_header("Authorization"))
-            return io.BytesIO(json.dumps([release("v1.6.20")]).encode("utf-8"))
+        class Opener(object):
+            def open(self, request, timeout=None):
+                sent.append(request.get_header("Authorization"))
+                return io.BytesIO(
+                    json.dumps([release("v1.6.20")]).encode("utf-8"))
 
         with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
             with mock.patch.dict(os.environ, {wb_updates.TOKEN_ENV: token}):
-                with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+                with mock.patch.object(wb_updates, "_opener", lambda proxy="": Opener()):
                     status = checker(d, wb_updates.fetch_releases).check(manual=True)
             self.assertEqual(sent[0], "Bearer " + token)
             self.assertEqual(status["latest_version"], "1.6.20")
@@ -650,6 +782,43 @@ class RouteTests(unittest.TestCase):
             worker.start()
             try:
                 self._save(d, {"update_check_enabled": True}, updates=worker)
+                self.assertTrue(worker._wake.is_set())
+            finally:
+                worker.stop()
+                worker.join(timeout=5)
+
+    def test_settings_save_validates_and_persists_the_update_proxy_slot(self):
+        with tempfile.TemporaryDirectory(prefix="upd-route-") as d:
+            wb_settings.set_proxy_slots(d, [
+                {"id": "slot-1", "name": "Tokyo", "url": "http://127.0.0.1:7890"},
+            ])
+            request = self._save(d, {"update_check_proxy_slot": "slot-1"})
+            self.assertEqual(request.status, 200)
+            self.assertEqual(request.reply["update_check_proxy_slot"], "slot-1")
+            self.assertEqual(wb_settings.update_check_proxy_slot(d), "slot-1")
+            request = self._save(d, {
+                "update_check_proxy_slot": wb_settings.UPDATE_CHECK_PROXY_SYSTEM})
+            self.assertEqual(request.status, 200)
+            self.assertEqual(wb_settings.update_check_proxy_slot(d),
+                             wb_settings.UPDATE_CHECK_PROXY_SYSTEM)
+            request = self._save(d, {"update_check_proxy_slot": ""})
+            self.assertEqual(request.status, 200)
+            self.assertEqual(wb_settings.update_check_proxy_slot(d), "")
+            for bad in ("missing", None, 1):
+                request = self._save(d, {"update_check_proxy_slot": bad})
+                self.assertEqual(request.status, 400, bad)
+            self.assertEqual(wb_settings.update_check_proxy_slot(d), "")
+
+    def test_changing_the_update_proxy_wakes_a_parked_worker(self):
+        with tempfile.TemporaryDirectory(prefix="upd-route-") as d:
+            wb_settings.set_proxy_slots(d, [
+                {"id": "slot-1", "name": "Tokyo", "url": "http://127.0.0.1:7890"},
+            ])
+            worker = checker(d, FakeFetcher([release("v1.6.18")]),
+                             first_delay=3600, poll_seconds=3600)
+            worker.start()
+            try:
+                self._save(d, {"update_check_proxy_slot": "slot-1"}, updates=worker)
                 self.assertTrue(worker._wake.is_set())
             finally:
                 worker.stop()

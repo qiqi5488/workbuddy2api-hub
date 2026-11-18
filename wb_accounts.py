@@ -2,6 +2,7 @@ import re
 import base64
 import datetime
 import json
+import math
 import os
 import random
 import ssl
@@ -13,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from wb_fingerprint import derive_id, generate_request_id, session_id
+import wb_pool_scope
 import wb_activity
 import wb_atrest
 import wb_catalog
@@ -61,10 +63,6 @@ WEB_TURN_ATTEMPTS = 3
 WEB_BUDGET_DEFAULT = 600
 #: 剩余预算低于这个值就不再开新的一轮：一轮至少要能等到会话真的跑起来。
 WEB_BUDGET_MIN_ROUND = 30
-#: 桌面腿（轻量对话）在首选模型冷却时顺延用的免费模型。网页腿不看这份名单 ——
-#: 那边的回退就是面板上的候选序列。
-DAILY_CHAT_DESKTOP_FALLBACKS = ("hy3", "hy4-preview-f", "hy4-preview",
-                                "glm-5.3-flash")
 #: 还没跑到 turn 就失败（建会话 5xx、取沙箱失败）时的退避基数（秒）。
 #: 那几轮只花掉几百毫秒、不消耗任何等待预算，背靠背重试等于把全部尝试挤进
 #: 同一个上游故障窗口（issue #558：8 个账号 × 6 次尝试全落进约 100 秒的抖动）。
@@ -259,10 +257,13 @@ def fetch_account_profile(account, timeout=15):
         data = json.loads(resp.read().decode("utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError("profile response is not an object")
-    uid = str(data.get("uid") or "")
+    # The console endpoint used to return uid/nickname at the top level and
+    # now wraps the profile in {"code": 0, "data": {...}}. Accept both shapes.
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    uid = str(payload.get("uid") or "")
     if uid and account.uid and uid != account.uid:
         raise RuntimeError("profile uid mismatch")
-    nickname = data.get("nickname")
+    nickname = payload.get("nickname")
     return uid, nickname.strip() if isinstance(nickname, str) else ""
 
 
@@ -305,11 +306,23 @@ def urlopen(req, timeout=30, proxy=""):
     池路径会原样发这些头名（见 wb_proxy.open_upstream）；没挂的请求（billing /
     登录 / 签到等）走原来的 .title() 路径，行为不变。
     """
+    target_is_https = str(req.full_url).lower().startswith("https://")
+    bridge_required = (target_is_https
+                       and wb_upstream_pool.tls_bridge_required())
+    if bridge_required and not wb_upstream_pool.enabled():
+        raise RuntimeError("TLS bridge requires WB_UPSTREAM_KEEPALIVE to be enabled")
     if wb_upstream_pool.enabled():
         try:
             return wb_upstream_pool.urlopen(req, timeout=timeout, proxy=proxy)
-        except wb_upstream_pool.PoolBypass:
-            pass
+        except wb_upstream_pool.PoolBypass as exc:
+            if bridge_required:
+                raise RuntimeError("TLS bridge cannot handle this proxy or redirect") from None
+            wb_upstream_pool.record_python_fallback(
+                getattr(exc, "reason", "proxy_unsupported"))
+    elif target_is_https:
+        # The bridge currently rides on the keep-alive path. Keep the fallback
+        # visible instead of silently presenting urllib as the selected route.
+        wb_upstream_pool.record_python_fallback("keepalive_disabled")
     opener = opener_for_proxy(proxy)
     if opener is None:
         return urllib.request.urlopen(req, timeout=timeout)
@@ -436,6 +449,14 @@ TIER_TTL_SECONDS = 24 * 3600.0
 
 LOGIN_PENDING = 11217
 LOGIN_TTL_SECONDS = 600
+# proxySlot value asking start_login to pick a random free proxy slot.
+LOGIN_SLOT_AUTO = "auto"
+
+
+class LoginProxySlotError(ValueError):
+    """The proxy slot asked for by a login does not exist or is disabled."""
+
+
 USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
 
 #: 签到文案判据。10001 在本仓库**不是**「签到成功」专属码：活动补偿的
@@ -454,16 +475,30 @@ def checkin_state(code, msg):
     只有 checked / already 能写 last_checkin：写早了（旧实现拿到 HTTP 200 就
     先写盘）会让当天 can_checkin() 恒为 False，这次失败被永久放弃，9 点与
     21 点两轮再也不会重试，面板还显示「今日已领」。
+
+    判定顺序有讲究，不能按 code 分支各判各的：上游重复签到回的是
+    `code=0, msg=今天已签到，请明天再来`（生产实测 1288 条签到记录里 250 条
+    都是它），旧实现只在 code=10001 时才认「已签到」，于是这 250 次都被当成
+    "又签成了一次"，面板还弹「签到成功 (+100积分)」。
+
+    顺序：pending → failed → already → checked。
+    - pending 最先：「请求处理中，请勿重复操作」是明确没签成，且不能落盘；
+    - failed 先于 already：「签到失败，已签到天数不足 7 天」同时含「失败」和
+      「已签到」，语义是失败，不能被 already 抢走；
+    - already 先于 checked：code=0 + 「今天已签到」是"今天早就签过了"，不是
+      本次签到成功，两者要分开展示。
     """
     text = str(msg or "")
     if any(k in text for k in CHECKIN_PENDING_HINTS):
         return "pending"
-    if code == 0:
+    if any(k in text for k in CHECKIN_FAILURE_HINTS):
         # 「失败」是唯一的硬词：CHECKIN_FAILURE_HINTS 之外的口径太宽，
         # 「签到成功，距离 7 天奖励还不足」里的「不足」会把成功判成失败。
-        return "failed" if any(k in text for k in CHECKIN_FAILURE_HINTS) else "checked"
-    if code == 10001:
-        return "already" if any(k in text for k in CHECKIN_ALREADY_HINTS) else "failed"
+        return "failed"
+    if any(k in text for k in CHECKIN_ALREADY_HINTS):
+        return "already"
+    if code == 0:
+        return "checked"
     return "failed"
 
 
@@ -545,7 +580,8 @@ REALM_MARKERS = {"cn": CN_REALM_MARKERS, "intl": INTL_REALM_MARKERS}
 #: 不在这套 24h 窗口配额里。键与 Account.realm 的取值一致（intl / cn），
 #: 国内版的 deepseek-v4.1-flash 是收费模型（x0.11），不在名单内。
 FREE_CAP_MODELS = {
-    "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash"}),
+    "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash",
+                        "deepseek-v4.1-flash-sg"}),
     "cn": frozenset({"hy4-preview-f", "hy3"}),
 }
 
@@ -699,6 +735,33 @@ def resolve_device_token(accounts_dir):
     return token
 
 
+def reload_device_token(accounts_dir):
+    """Drop the shared token cache, then resolve the current token immediately."""
+    with _DEVICE_TOKEN_LOCK:
+        _DEVICE_TOKEN_CACHE.update({"key": None, "token": "", "at": 0.0})
+    return resolve_device_token(accounts_dir)
+
+
+def device_token_status(accounts_dir):
+    """Redacted device-token diagnostics; the token itself never leaves memory."""
+    try:
+        cfg = wb_settings.upstream_config(accounts_dir)
+    except Exception:
+        cfg = {}
+    literal = str(cfg.get("device_token") or "").strip()
+    path = str(cfg.get("device_token_file") or "").strip()
+    token = resolve_device_token(accounts_dir)
+    with _DEVICE_TOKEN_LOCK:
+        cached_at = int(_DEVICE_TOKEN_CACHE.get("at") or 0)
+    return {
+        "source": "literal" if literal else ("file" if path else "none"),
+        "configured_file": path,
+        "loaded": bool(token),
+        "length": len(token),
+        "cached_at": cached_at,
+    }
+
+
 def next_local_4am(now=None):
     """Epoch of the next local 04:00.
 
@@ -746,12 +809,17 @@ except (TypeError, ValueError):
 DEGRADE_THRESHOLD = 5           # consecutive unknown failures before degrading
 DEGRADE_COOLDOWN = 600.0        # first degrade window: 10 minutes
 DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
-# 上游账号级风控限制（HTTP 403 / code 11140「账号存在异常行为，已被限制使用」）
-# 的冷却时长。上游按小时到工作日计：社区复盘里官方工单给的口径是「临时风控
-# 1-3 个工作日自动解除」，期间官方客户端同样报这个错，所以这不是内容审核、
-# 也不能靠换提示词或换号解决。取 2 小时作第一档，到期再试一次即可。
-# 与其它冷却不同，这个期限是**持久化**的（见 note_restricted）。
-RESTRICTED_ACCOUNT_COOLDOWN = 7200.0
+# 上游账号级封禁（HTTP 403 / code 11140「账号存在异常行为，已被限制使用」）
+# 不是冷却或限流：官方客户端同样报这个错，自动到期再试只会继续喂风控。
+# 账号一旦命中就持久化为禁用，只有操作者在面板手动启用才重新入池。
+RESTRICTED_ACCOUNT_COOLDOWN = 0.0
+
+# 临期积分优先的权重放大系数。_expiry_weight() 算出的乘积（紧迫度 × 剩余量，
+# 约 1.0–5.5）乘上它再取整，让相邻档位之间留出足够的分辨率：不放大时
+# round() 会把一整段天数压成同一个整数，权重就失去区分度（实测生产池 110 个
+# 账号权重全部相同，退化成纯轮询）。取 10 表示最急的账号大约拿到最不急的
+# 5 倍流量，而不是独占。
+EXPIRY_WEIGHT_SCALE = 10.0
 
 
 def _exponential_backoff(count, base, cap, offset):
@@ -804,6 +872,50 @@ def _clean_candidates(models):
         seen.add(name)
         ordered.append(name)
     return ordered
+
+
+def _nested_error_code(value):
+    """First numeric upstream ``code`` in a JSON object, including error.data."""
+    if not isinstance(value, dict):
+        return None
+    for key in ("code", "errorCode", "error_code"):
+        raw = value.get(key)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return int(raw)
+        if isinstance(raw, str) and raw.strip().isdigit():
+            return int(raw.strip())
+    for key in ("error", "data", "detail"):
+        found = _nested_error_code(value.get(key))
+        if found is not None:
+            return found
+    return None
+
+
+def _daily_chat_model_fallback_allowed(status, detail):
+    """Whether a failed daily-activity desktop request should try the next model.
+
+    Authentication, account bans, and content-policy rejections stay terminal.
+    Quota/rate/model-availability failures are exactly what the free-model
+    fallback is for.
+    """
+    text = str(detail or "")
+    lower = text.lower()
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+    code = _nested_error_code(payload)
+    if code == 11140 or status == 401:
+        return False
+    if code in (14018, 6004, 6005):
+        return True
+    if status in (402, 408, 429) or (isinstance(status, int) and status >= 500):
+        return True
+    return any(token in lower for token in (
+        "insufficient credit", "credits exhausted", "credit exhausted",
+        "quota", "rate limit", "frequency limit", "model not found",
+        "no such model", "invalid model", "unsupported model",
+        "额度", "积分", "限流", "模型不存在", "不支持该模型"))
 
 
 def _model_credit_rank(model, realm):
@@ -914,6 +1026,9 @@ class Account(object):
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
         self.refresh_token = str(data.get("refreshToken") or "")
+        self.device_token = str(
+            data.get("deviceToken") or data.get("device_token") or ""
+        ).strip()
         # 静态 Key 永不过期（expiresAt 恒 0）。写 0 而不是「解 JWT 得到的 0」
         # 是有意的：ready() 里 exp 为 0 表示「不按时间淘汰」。
         self.expires_at = (0 if self.is_api_key
@@ -952,6 +1067,11 @@ class Account(object):
         # 写过，超长截断，别让一条长备注把账号行撑爆。
         raw_note = data.get("note")
         self.note = (raw_note if isinstance(raw_note, str) else "").strip()[:200]
+        # Free-form operator label used to filter and batch-act on a subset of
+        # the pool. Unlike API-key whitelists, a group is display/selection
+        # metadata and never changes routing by itself.
+        raw_group = data.get("group")
+        self.group = (raw_group if isinstance(raw_group, str) else "").strip()[:64]
         # 该账号**人工**禁用的模型名单（面板 / 接口配置）。与 weight、note 同款：
         # 随凭证档持久化 —— 这是使用者的明确意图，不该在重启后悄悄回到默认。
         #
@@ -964,6 +1084,14 @@ class Account(object):
         # 只做精确匹配不做前缀：行为可预期，不会误伤同前缀的其他模型。
         raw_deny = data.get("disabledModels")
         self.disabled_models = normalise_disabled_models(raw_deny)
+        # 号池归属：text=只跑文本模型，media=只跑图片/视频。老账号没有这个
+        # 字段时一律留在文本号池——任意 disabledModels 都不能推断成媒体号，
+        # 否则一次模型黑名单就会把正常对话账号悄悄挪走。
+        ps = data.get("poolScope")
+        if ps in ("text", "media"):
+            self.pool_scope = ps
+        else:
+            self.pool_scope = wb_pool_scope.DEFAULT_SCOPE
         # Live error state, never restored from the credential file: the label
         # describes the last upstream answer, not the credential. It used to be
         # persisted and read back, so a 429 that had long since recovered came
@@ -979,22 +1107,46 @@ class Account(object):
         self.cooldown_until = 0.0
         # 运行时标记：上游返回 401 或 token 为空时置为 True，提示需重新登录
         self.token_expired = bool(not self.access_token)
-        # 上游账号级风控限制（403 / code 11140「账号存在异常行为，已被限制
-        # 使用」）的解除时刻。与上面那些节流窗口不同，这一条**持久化**：上游的
-        # 限制按小时到工作日计，网关重启 / 换身分 / 刷新 token 都不能让它重新
-        # 入池——否则同一台设备上的账号会被一个个送进风控（见 note_restricted
-        # 与社区复盘「解封前严禁换号继续打同一设备」）。
-        self.restricted_until = 0.0
+        # 上游账号级封禁（403 / code 11140）：不是有期限的冷却，而是持久化的
+        # 禁用状态。重启、刷新 token、换身份、一键测试都不能自动放回池子；
+        # 只有操作者在面板手动启用才解除。旧版本的 restrictedUntil 在加载时
+        # 迁移成同一状态，避免升级后把仍被封的账号重新派出去。
+        self.account_banned = bool(data.get("accountBanned"))
+        self.banned_at = 0.0
         try:
-            self.restricted_until = max(0.0, float(data.get("restrictedUntil") or 0))
+            self.banned_at = max(0.0, float(data.get("bannedAt") or 0))
         except (TypeError, ValueError):
-            self.restricted_until = 0.0
+            self.banned_at = 0.0
+        legacy_restricted = 0.0
+        try:
+            legacy_restricted = max(
+                0.0, float(data.get("restrictedUntil") or 0))
+        except (TypeError, ValueError):
+            legacy_restricted = 0.0
+        if legacy_restricted > time.time():
+            self.account_banned = True
+            self.enabled = False
+            self.tasks_enabled = False
+            if not self.banned_at:
+                self.banned_at = time.time()
+        # 兼容旧代码/旧测试的只读属性：封禁已不再按时间自动解除。
+        self.restricted_until = 0.0
         # Per-model throttling. Upstream rate limits (code 6004 "usage exceeds
         # frequency limit") apply to ONE model for one account, not to the whole
         # account: other models keep working. Cooldown the offending model only,
         # otherwise a single throttled model blackholes every request on the pool.
         # Deliberately runtime-only (not persisted): see VOLATILE_FIELDS.
         self.model_cooldowns = {}
+        # 「这条冷却是上游判定额度用满（6004）」的标记：模型 -> 撞线时刻。
+        # 与 model_cooldowns 同款运行时态（重启即清零），但窗口探针会把
+        # 事实落在 accounts/model_windows.json 里，重启后由
+        # restore_window_cooldowns() 连同冷却一起挂回来（issue #668）。
+        #
+        # 为什么单独一张表：凭证档的 model_caps 只覆盖免费模型（限额联动的
+        # 范围），收费模型撞 6004 一样是"配额用尽"，但它不写 model_caps，
+        # 于是面板把它显示成"429 临时限流（60s~10m 的短窗口）"，而真实恢复
+        # 时刻在 20 小时以后。
+        self.model_cap_marks = {}
         # 每个模型冷却窗口是**什么时候挂上的**（model -> epoch）。model_cooldowns
         # 只留恢复时刻，起始时刻以前被丢掉：面板因此无法如实说「限流时刻」，只能
         # 用「—」占位，把 60s 的短时 parking 和几小时的 6004 撞线画成一样。与
@@ -1091,9 +1243,9 @@ class Account(object):
         # AccountPool.apply_daily_credit_limit(); 0 disables the guard.
         self.daily_credit_limit = 0
         self.daily_credits_today = None
-        # The realm's free model ids, pushed by the same apply call. Empty
-        # until then, and an unknown model counts as paid, so the guard
-        # fails closed instead of leaking spend through unseen names.
+        # The realm's free model ids, pushed by the daily-credit and reserve
+        # apply calls. Empty until then, and an unknown model counts as paid,
+        # so both guards fail closed instead of leaking spend through unseen ids.
         self.free_models = frozenset()
         # Per-model daily guard: once ONE model burned the configured tokens
         # today the account stops being handed out for that model only -
@@ -1152,13 +1304,17 @@ class Account(object):
             "tasksEnabled": bool(self.tasks_enabled),
             "weight": self.weight,
             "note": self.note,
+            "group": self.group,
             "disabledModels": list(self.disabled_models),
+            "poolScope": self.pool_scope,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
-            # 持久化：上游风控限制按小时到工作日计，重启后仍然成立（见
-            # note_restricted）。导出的文档会带上它供查看，导入侧
-            # normalise_import_row() 不认这个字段，换机器不会把账号一起停掉。
-            "restrictedUntil": self.restricted_until,
+            # 持久化：上游账号封禁按小时到工作日计，重启后仍然成立（见
+            # note_restricted）。导入侧不认这个字段，换机器不会把账号一起停掉。
+            "accountBanned": bool(self.account_banned),
+            "bannedAt": self.banned_at,
+            # 保留旧字段供老版本读取；新版本不再用它表达封禁状态。
+            "restrictedUntil": 0.0,
             "credits": self.credits,
             # 账号档位（#505）。持久化：一天一次的计费摘要结论，重启后仍然
             # 有效；导入到另一台机器时按 VOLATILE_FIELDS 丢掉，不把上一台
@@ -1177,9 +1333,7 @@ class Account(object):
             error = self.last_error
             detail = self.last_error_detail
             deadline = max(self.cooldown_until, self.balance_until,
-                           self.breaker_until, self.degrade_until,
-                           self.restricted_until)
-            restricted = self.restricted_until
+                           self.breaker_until, self.degrade_until)
             active = [(model, until) for model, until in self.model_cooldowns.items()
                       if until > now]
         active.sort(key=lambda pair: (pair[1], pair[0]))
@@ -1193,10 +1347,24 @@ class Account(object):
                 entry["startedAt"] = int(started)
             # 撞线时间只在 cap 还在恢复期内时带上：它同时说明这次禁用是
             # 「额度用满」（6004）而不是一次临时限流，面板据此显示两段时间。
+            #
+            # 两个来源：凭证档的 model_caps（免费模型，限额联动范围内），以及
+            # 运行时/窗口探针记下的 model_cap_marks（任何模型，含国内版按积分
+            # 计费的 deepseek-v4.1-flash）。后者补上的是"付费模型撞 6004"这个
+            # 事实——不补的话面板只能写成"临时限流（60s~10m）"，而真实恢复
+            # 时刻在 20 小时以后（issue #668）。
+            capped_at = 0
             if self.cap_until(model, now) > 0:
-                entry["cappedAt"] = int(self.model_caps[model]["at"])
+                capped_at = int(self.model_caps[model]["at"])
+            else:
+                try:
+                    capped_at = int(self.model_cap_marks.get(model) or 0)
+                except (TypeError, ValueError):
+                    capped_at = 0
+            if capped_at:
+                entry["cappedAt"] = capped_at
             models.append(entry)
-        return error, deadline, models, detail, restricted
+        return error, deadline, models, detail
 
     def model_cooldowns_snapshot(self):
         """Active model cooldowns, ordered by recovery time (epoch seconds)."""
@@ -1206,7 +1374,7 @@ class Account(object):
         exp = self.expires_at or jwt_exp(self.access_token)
         now = time.time()
         is_token_expired = bool(getattr(self, "token_expired", False) or (exp and exp <= now) or not self.access_token)
-        last_error, deadline, models, last_error_detail, restricted = \
+        last_error, deadline, models, last_error_detail = \
             self._throttle_snapshot(now)
         return {
             "uid": self.uid,
@@ -1220,7 +1388,9 @@ class Account(object):
             "tasksEnabled": bool(self.tasks_enabled),
             "weight": int(self.weight),
             "note": self.note,
+            "group": self.group,
             "disabledModels": list(self.disabled_models),
+            "poolScope": self.pool_scope,
             "source": self.source,
             "apiKey": bool(self.is_api_key),
             "credentialMask": self.credential_mask(),
@@ -1231,13 +1401,14 @@ class Account(object):
             "tokenExpired": is_token_expired,
             "needRelogin": is_token_expired,
             "hasRefreshToken": bool(self.refresh_token),
+            "hasDeviceToken": bool(self.device_token),
             "lastError": last_error,
             "lastErrorDetail": last_error_detail or None,
             "inCooldown": deadline > now,
             "cooldownFor": round(max(0.0, deadline - now)) or None,
-            # 上游账号级风控限制（403 / 11140）：面板据此把账号标成「风控限制」
-            # 而不是普通冷却，并提示去官方渠道申诉而不是换号重试。
-            "restrictedFor": round(max(0.0, restricted - now)) or None,
+            # 上游账号封禁（403 / 11140）：持久禁用，必须手动重新启用。
+            "accountBanned": bool(self.account_banned),
+            "bannedAt": self.banned_at or None,
             "modelCooldowns": models,
             "softStreak": int(self.soft_streak),
             "unscopedStreak": int(self.unscoped_streak),
@@ -1254,6 +1425,7 @@ class Account(object):
             # 账号档位（#505）：面板在「会员类型」旁显示包名与读取时刻。
             "tier": self.tier,
             "reserveCredits": int(self.reserve_credits or 0),
+            # Account-level state, even while an explicitly free model serves.
             "reserveBlocked": self.reserve_blocked(),
             "dailyTokenLimit": int(self.daily_token_limit or 0),
             "dailyTokensToday": (int(self.daily_tokens_today)
@@ -1346,6 +1518,11 @@ class Account(object):
                 # every restart (see RUNTIME_ONLY_FIELDS).
                 for field in RUNTIME_ONLY_FIELDS:
                     payload.pop(field, None)
+                if self.device_token:
+                    payload["deviceToken"] = self.device_token
+                else:
+                    payload.pop("deviceToken", None)
+                    payload.pop("device_token", None)
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
@@ -1362,14 +1539,18 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
-    def reserve_blocked(self):
-        """True when the low-credit guard should keep this account idle.
+    def reserve_blocked(self, model=None):
+        """True when the low-credit guard should keep this account off `model`.
 
         Only a *known* balance can block: an account whose credits were never
         fetched stays usable, otherwise a fresh install would look empty.
+        A positive reserve exempts models the realm catalogue marks free;
+        paid, unknown, and model-less calls retain the account-level guard.
         """
         reserve = int(self.reserve_credits or 0)
         if reserve <= 0:
+            return False
+        if model and self.model_is_free(model):
             return False
         credits = self.credits
         if not isinstance(credits, dict):
@@ -1467,6 +1648,43 @@ class Account(object):
             if soonest is None or days < soonest:
                 soonest = float(days)
         return soonest
+
+    def soonest_expiring_remain(self):
+        """How many credits the soonest-lapsing package still holds.
+
+        The companion of `soonest_expiring_days()`: that one says *when* the
+        first package lapses, this one says *how much* is still unspent in it.
+        Both come from the same package, so the weight in `_expiry_weight()`
+        multiplies urgency by the amount actually at risk of being wasted.
+
+        None when nothing can be said - no credit data, no package with a
+        usable remainder, or no end date - which keeps an unjudgeable account
+        on weight 1 instead of guessing.
+        """
+        credits = self.credits
+        if not isinstance(credits, dict):
+            return None
+        soonest = None
+        remain_of_soonest = None
+        for package in (credits.get("packages") or []):
+            if not isinstance(package, dict):
+                continue
+            if package.get("no_expiry"):
+                continue
+            if package.get("package_code") == "enterprise":
+                continue
+            if package.get("is_expired"):
+                continue
+            days = package.get("days_left")
+            remain = package.get("remain")
+            if not isinstance(days, (int, float)) or days < 0:
+                continue
+            if not isinstance(remain, (int, float)) or remain <= 0:
+                continue
+            if soonest is None or days < soonest:
+                soonest = float(days)
+                remain_of_soonest = float(remain)
+        return remain_of_soonest
 
     def in_expiring_window(self):
         """True when this account should jump the dispatch queue.
@@ -1656,6 +1874,49 @@ class Account(object):
                 out.add(mid)
         return out
 
+    def model_cooldown_until(self, model=None):
+        """这个模型当前的冷却截止时刻（没有冷却则 0）。"""
+        if not model:
+            return 0.0
+        try:
+            return float((self.model_cooldowns or {}).get(model, 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def blocked_by_model_cooldown(self, model=None, now=None):
+        """这个账号此刻是不是"只因为这个模型还在上游限流窗口里"而不可用。
+
+        模型冷却是上游自己的回答："这个模型的窗口用满了，到 T 重置"。凭证本身
+        没问题，账号池也没有坏，只是在等。因此池级报错要说清"在等什么、等到
+        什么时候"，而不是报成"没有可用账号"（issue #665）。
+
+        判定与 `ready()` 同序（人工黑名单 → 档位 → 余额保留 → 日限额 → 积分
+        限额 → 模型日限额），只是把"临期凭证"那条排除在外：刷新是网络动作，
+        这条判断要保持只读。
+        """
+        now = time.time() if now is None else now
+        if not model:
+            return False
+        if self.model_cooldown_until(model) <= now:
+            return False
+        if not self.enabled or not self.access_token \
+                or getattr(self, "token_expired", False):
+            return False
+        if self.model_disabled(model):
+            return False
+        if (not getattr(self, "is_paid_user", False)
+                and wb_tiers.requires_pro(model, self.realm)):
+            return False
+        if self.reserve_blocked():
+            return False
+        if self.daily_limit_blocked():
+            return False
+        if self.credit_limit_blocked(model):
+            return False
+        if self.model_token_limit_blocked(model):
+            return False
+        return True
+
     def unavailable_reason(self, model=None):
         """这个账号此刻为什么接不了单；可用时返回空字符串。
 
@@ -1665,6 +1926,8 @@ class Account(object):
         拒绝的原因（唯一不覆盖的是临期凭证那条：它会真的发起刷新，诊断路径上
         不该顺带打上游）。
         """
+        if self.account_banned:
+            return "账号封禁（需手动启用）"
         if not self.enabled:
             return "已停用"
         if not self.access_token:
@@ -1682,8 +1945,7 @@ class Account(object):
         # 四种惩罚的到期时间各走各的，谁把时间推得最远就报谁：只报「冷却」
         # 会让人往 429 的方向查，而实际可能是上游连续断连触发的熔断（30 分钟
         # 起，与账号本身无关），或者余额保护这类完全不同的原因。
-        penalties = [("上游风控限制", self.restricted_until),
-                     ("熔断", self.breaker_until), ("降权", self.degrade_until),
+        penalties = [("熔断", self.breaker_until), ("降权", self.degrade_until),
                      ("余额保护", self.balance_until), ("软限流冷却", self.cooldown_until)]
         if model:
             penalties.append(("模型 %s 冷却" % model, self.model_cooldowns.get(model, 0.0)))
@@ -1698,7 +1960,7 @@ class Account(object):
             elif label.startswith("模型") and self.unscoped_streak > 1:
                 streak = "（连续第 %d 次）" % self.unscoped_streak
             return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
-        if self.reserve_blocked():
+        if self.reserve_blocked(model):
             return "余额低于保留线"
         if self.daily_limit_blocked():
             return "今日 Token 额度用尽"
@@ -1722,8 +1984,9 @@ class Account(object):
             return False
         return str(model).strip().lower() in self.disabled_models
 
-    def ready(self, model=None):
-        if not self.enabled or not self.access_token or getattr(self, "token_expired", False):
+    def ready(self, model=None, refresh=True):
+        if (self.account_banned or not self.enabled
+                or not self.access_token or getattr(self, "token_expired", False)):
             return False
         # 人工黑名单排在最前：它是静态配置（最便宜），而且在语义上优先于所有
         # 「暂时不可用」的判断 —— 被禁用的模型不该因为账号恰好恢复了就漏进来。
@@ -1738,9 +2001,9 @@ class Account(object):
             return False
         if self.throttle_wait(model=model) > 0:
             return False
-        # Parked below the reserve: serving a request here is what would push
-        # the balance to zero and trigger the upstream reminder SMS.
-        if self.reserve_blocked():
+        # A positive reserve stops paid requests below the floor; catalogue-
+        # free models cannot spend the balance this guard protects.
+        if self.reserve_blocked(model):
             return False
         # Today's token budget is spent: keep the seat for tomorrow instead
         # of letting the upstream answer 429 for the rest of the day.
@@ -1765,7 +2028,14 @@ class Account(object):
             # Returning True unconditionally here kept handing out an account
             # whose token was about to expire, so requests went upstream with a
             # stale credential and came back 401/403.
+            if not refresh:
+                # 只读口径（/health 的按模型统计）：不发起刷新，也不把"快到期"
+                # 算成不可用。刷新是网络动作，探针不该因它抖动，也不该把一
+                # 次失败放大成每个模型一次重试。
+                return True
             return self.refresh()
+        if not refresh:
+            return True
         return self.refresh()
 
     def is_cli_identity(self):
@@ -1773,11 +2043,13 @@ class Account(object):
         return self.product == wb_identity.PRODUCT_CLI
 
     def headers(self, purpose="chat", session_key=None, turn_request_id=None,
-                model=None, conversation_id=None):
+                model=None, conversation_id=None, media_identity=None):
         """组出这一轮的出站标头。
 
         chat 用途走 wb_identity（CLI 头 / WorkBuddy 头 / VSCode 头，可切换）；
-        billing 用途维持原本的轻量标头，计费端点不吃那套身分。
+        billing 用途维持原本的轻量标头，计费端点不吃那套身分；media 用途复用
+        chat 那份身分再加三个媒体端点特有的头（生图 / 生视频的 /v2/images/*、
+        /v2/videos/*），见该分支里的注释。
 
         `model` / `conversation_id` 只对 chat 用途有意义：官方 VSCode 扩展在
         model 请求上带 `X-Model-ID`（值就是本次 model），`X-Conversation-ID`
@@ -1807,8 +2079,62 @@ class Account(object):
         相悖）。见 wb_fingerprint.session_id。
         """
         cfg = get_realm_config(self.realm)
+        accounts_dir = (getattr(self, "accounts_dir", "")
+                        or (os.path.dirname(self.path) if self.path else ""))
 
         if purpose != "chat":
+            if purpose == "media":
+                # 媒体端点（/v2/images/*、/v2/videos/*）的出站标头。
+                #
+                # 组法：直接复用本账号 chat 那份身分（build_identity_headers，与
+                # chat 分支同一个函数），再补三个媒体端点要的头。理由两条：
+                #   1) 同一个客户端发的所有请求，头形状一致最自然；chat 已经在同一
+                #      个 host（copilot.tencent.com / www.workbuddy.ai）上稳定 200；
+                #   2) dsh 插件的 imageHeaders 是拿 **CLI 身份**的账号实测出来的，
+                #      本仓库账号是桌面身份（product=workbuddy），照抄它的 UA 反而
+                #      是猜测。要切到 CLI 形状就把 media_identity="cli" 传进来，
+                #      P0 取证之后由配置决定默认值，不用改这里。
+                #
+                # 差异只有三处，都是媒体端点特有的：Accept 用列表形态、补
+                # X-Requested-With、补企业标识（chat 的桌面分支不发 X-Enterprise-Id）。
+                # 刻意**不带** Origin / Referer：dsh 的取证探针就是不带这两个头拿到
+                # 200 的，多带两个头只多一个可能被网关拒掉的变量，没有收益。
+                product = wb_identity.normalize_product(
+                    media_identity or self.product)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+                headers.update(wb_identity.build_identity_headers(
+                    product=product,
+                    realm=self.realm,
+                    uid=self.uid,
+                    token=self.access_token,
+                    enterprise_id=self.enterprise_id,
+                    tenant_id=self.enterprise_id,
+                    private_data=(wb_settings.identity_private_data(
+                        accounts_dir) if accounts_dir else "auto"),
+                    accounts_dir=accounts_dir,
+                ))
+                if self.enterprise_id:
+                    headers["X-Enterprise-Id"] = self.enterprise_id
+                    headers["X-Tenant-Id"] = self.enterprise_id
+                else:
+                    headers["X-No-Enterprise-Id"] = "1"
+                if self.realm == "cn":
+                    headers["X-Product"] = "SaaS"
+                if self.is_api_key:
+                    # 与 chat / billing 两条路口径一致：静态 Key 两个鉴权头都发。
+                    headers["X-API-Key"] = self.access_token
+                # 国内版才发设备 token（国际版客户端本来就没有这个头，见 #448）；
+                # CLI 身份全包没有设备 token 逻辑。
+                device_token = (self._device_token()
+                                if self.realm == "cn" and not self.is_cli_identity()
+                                else "")
+                if device_token:
+                    headers["X-Device-Token"] = device_token
+                return headers
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/plain, */*",
@@ -1854,11 +2180,12 @@ class Account(object):
             turn_request_id=turn_request_id,
             model=model,
             private_data=(wb_settings.identity_private_data(
-                os.path.dirname(self.path)) if self.path else "auto"),
+                accounts_dir) if accounts_dir else "auto"),
+            accounts_dir=accounts_dir,
         )
         if self.is_cli_identity() or (
                 self.product == wb_identity.PRODUCT_DESKTOP
-                and wb_identity.desktop_chat_compat_enabled()):
+                and wb_identity.desktop_chat_compat_enabled(accounts_dir)):
             # Opt-in desktop chat uses the SDK profile, not the billing web profile.
             # 官方 CLI 的 chat 请求由 OpenAI Node SDK 发出：浏览器头一个都没有
             # （X-Requested-With 也没有），Accept 就是 application/json。
@@ -1894,8 +2221,12 @@ class Account(object):
         return headers
 
     def _device_token(self):
-        """Optional X-Device-Token from the configured literal or file."""
-        directory = getattr(self, "accounts_dir", "")
+        """Optional X-Device-Token: account value, then literal, then file."""
+        token = str(getattr(self, "device_token", "") or "").strip()
+        if token:
+            return token
+        directory = (getattr(self, "accounts_dir", "")
+                     or (os.path.dirname(self.path) if self.path else ""))
         if not directory:
             return ""
         return resolve_device_token(directory)
@@ -1907,6 +2238,8 @@ class Account(object):
         balance scheduler - and persists the new nickname immediately.
         """
         _uid, nickname = fetch_account_profile(self)
+        if not nickname:
+            raise RuntimeError("profile response has no nickname")
         if nickname and nickname != self.nickname:
             self.nickname = nickname
             directory = getattr(self, "accounts_dir", "")
@@ -2006,7 +2339,7 @@ class Account(object):
 
         Independent of `enabled`: `enabled` only controls API dispatch.
         """
-        return bool(self.tasks_enabled)
+        return bool(self.tasks_enabled) and not self.account_banned
 
     def can_checkin(self):
         if self.realm != "cn":
@@ -2021,6 +2354,10 @@ class Account(object):
 
     def can_daily_chat(self):
         if self.realm != "intl":
+            return False
+        # 403 / code 11140 是持久封禁；在操作者手动启用前，定时活跃不再
+        # 探测该账号。
+        if self.account_banned:
             return False
         if not self.last_daily_chat:
             return True
@@ -2061,12 +2398,9 @@ class Account(object):
         cooling down or capped falls through to the next candidate instead of
         failing the activity.
         """
-        candidates = self.web_fallback_models() or [DAILY_CHAT_MODEL]
-        if len(candidates) < 2:
-            # 桌面腿历史上会在首选模型冷却 / 达限时顺延到其它免费模型。候选序列
-            # 只配了一个（或没配）时保留这份顺延；网页腿的轮数仍只看候选序列。
-            candidates = candidates + [model for model in DAILY_CHAT_DESKTOP_FALLBACKS
-                                       if model not in candidates]
+        candidates = self.daily_chat_candidates()
+        if not candidates:
+            return ""
         now = time.time()
         with self._throttle_lock:
             for cand in candidates:
@@ -2076,18 +2410,14 @@ class Account(object):
                     return cand
         return candidates[0]
 
-    def web_fallback_models(self):
-        """The ordered model candidates the web leg walks through.
+    def daily_chat_candidates(self):
+        """Ordered candidates shared by both daily-activity legs.
 
-        An explicit list in the panel wins and is used **in that order** - it is
-        the operator's priority, not a suggestion. Only the automatic mode (no
-        list configured) sorts by catalogue multiplier, so a free model runs
-        before a cheap paid one and that one before an expensive one.
-
-        This replaces the old pair of settings (`daily_chat_model` for the
-        preferred model plus a separate fallback switch and combination): with
-        both set, the fallback branch took every model from the combination and
-        the preferred model never ran at all.
+        An explicit panel list always wins and is never reordered. In automatic
+        mode the ``daily_chat_prefer_flash`` switch decides whether Flash runs
+        before the free catalogue models or is skipped entirely. Free models
+        come from the live per-realm catalogue, so a newly free model appears
+        without a gateway release.
         """
         configured = []
         if self.path:
@@ -2095,9 +2425,31 @@ class Account(object):
                 os.path.dirname(self.path))
         if configured:
             return _clean_candidates(configured)
-        # 自动模式只有内置的免费模型一个候选：候选序列就是回退，没配就是不回退。
-        # 旧实现在这里额外塞进各区域的免费模型，只因为那套「回退组合」必须有人填。
-        return [DAILY_CHAT_MODEL]
+        import wb_proxy
+        candidates = []
+        prefer_flash = True
+        if self.path:
+            prefer_flash = wb_settings.daily_chat_prefer_flash(
+                os.path.dirname(self.path))
+        if prefer_flash:
+            candidates.append(DAILY_CHAT_MODEL)
+        candidates.extend(wb_proxy.free_model_candidates(self.realm))
+        return _clean_candidates(candidates)
+
+    def web_fallback_models(self):
+        """The ordered model candidates the web leg walks through.
+
+        An explicit list in the panel wins and is used **in that order** - it is
+        the operator's priority, not a suggestion. Only the automatic mode (no
+        list configured) uses the Flash preference switch plus the free models
+        in the live catalogue order.
+
+        This replaces the old pair of settings (`daily_chat_model` for the
+        preferred model plus a separate fallback switch and combination): with
+        both set, the fallback branch took every model from the combination and
+        the preferred model never ran at all.
+        """
+        return self.daily_chat_candidates()
 
     def daily_chat_web_prompt(self):
         """The prompt this turn sends on the web channel.
@@ -2161,7 +2513,12 @@ class Account(object):
         返回里带 attempts（实际跑了几轮）、models_tried、model，其余字段与
         _daily_chat_web_once 一致。
         """
-        models = self.web_fallback_models() or [self.daily_chat_model()]
+        models = self.web_fallback_models()
+        if not models:
+            return {"ok": False,
+                    "error": "自动模式没有可用的免费模型；请开启“优先 DeepSeek Flash”"
+                             "或在面板中指定候选模型",
+                    "retryable": False}
         turn_cap, rounds = self.daily_chat_web_policy()
         budget = self.daily_chat_budget()
         deadline = time.time() + budget if budget > 0 else None
@@ -2295,6 +2652,9 @@ class Account(object):
         if wait_seconds is None:
             wait_seconds = WEB_TURN_TIMEOUT
         model = model or self.daily_chat_model()
+        if not model:
+            return {"ok": False, "retryable": False,
+                    "error": "没有可用的每日活跃候选模型"}
         chosen_prompt = prompt or self.daily_chat_web_prompt()
         body = {
             "prompt": chosen_prompt,
@@ -2557,9 +2917,17 @@ class Account(object):
                           "limit": False}
         conversation = (payload.get("data") or {}).get("id")
         if payload.get("code") not in (0, None) or not conversation:
+            code = payload.get("code")
+            msg = str(payload.get("msg") or "")
+            text = ("%s %s" % (code, msg)).lower()
+            retryable = code in (14018, 6004, 6005) or any(
+                token in text for token in (
+                    "credit", "quota", "limit", "model not found",
+                    "no such model", "invalid model", "额度", "积分",
+                    "限流", "不存在"))
             return None, {"message": "code=%s msg=%s" % (payload.get("code"),
                                                          payload.get("msg")),
-                          "retryable": False, "limit": False}
+                          "retryable": retryable, "limit": False}
         return conversation, None
 
     def daily_chat(self, web=None, trigger="unknown"):
@@ -2575,6 +2943,11 @@ class Account(object):
         """
         if self.realm != "intl":
             return {"ok": False, "error": "daily chat is only for international accounts"}
+        # 11140 的持久封禁要和普通 chat 一样先挡住；这里单独返回失败形状，
+        # 不能把「账号被封禁」伪装成「今日活跃已完成」。
+        if self.account_banned:
+            return {"ok": False, "skipped": True, "restricted": True,
+                    "error": "账号已被上游封禁，需手动重新启用"}
         # 当日活跃成功后再触发（下一个定时点、手动补跑、并发重复调度）直接
         # 跳过，连桌面腿也不发：这一天的 30/50 积分已经拿到了。
         if not self.can_daily_chat():
@@ -2586,9 +2959,46 @@ class Account(object):
 
     def _daily_chat_upstream(self, web=None):
         """每日活跃对话的实际流程；返回形状见 daily_chat。"""
+        candidates = self.daily_chat_candidates()
+        if not candidates:
+            return {
+                "ok": False,
+                "error": "自动模式没有可用的免费模型；请开启“优先 DeepSeek Flash”"
+                         "或在面板中指定候选模型",
+            }
+        tried = []
+        last = None
+        for candidate in candidates:
+            tried.append(candidate)
+            result = self._daily_chat_desktop_once(candidate)
+            if result.get("ok") or result.get("restricted"):
+                result["models_tried"] = tried
+                result["model"] = candidate
+                if result.get("ok"):
+                    return self._daily_chat_web_step(result, web=web)
+                return result
+            last = result
+            if not result.get("retryable"):
+                result["models_tried"] = tried
+                result["model"] = candidate
+                return result
+            # Keep the account from immediately selecting the same failed
+            # model at the next scheduler slot. 6004 has its own persistent cap
+            # handling in the normal request path; this short cooldown is only
+            # for the lightweight daily leg.
+            self.note_error("daily activity model fallback", model=candidate,
+                            cooldown=60, detail=result.get("error") or "")
+        if last is not None:
+            last["models_tried"] = tried
+            last["model"] = tried[-1]
+            return last
+        return {"ok": False, "error": "每日活跃没有可尝试的模型"}
+
+    def _daily_chat_desktop_once(self, candidate):
+        """One desktop-identity attempt; the web leg runs after this succeeds."""
         import wb_proxy
         url = self.chat_base_url() + wb_proxy.CHAT_PATH
-        model = self.daily_chat_model()
+        model = wb_proxy.intl_model_alias(candidate, self.realm)
         headers = self.headers("chat", model=model)
         body = {
             "model": model,
@@ -2621,64 +3031,77 @@ class Account(object):
                 self.fetch_credits()
             except Exception:
                 pass
-            result = {"ok": True, "msg": "每日活跃对话成功完成"}
-            web_ok = True
-            if web is None:
-                web = bool(self.path) and wb_settings.daily_chat_web(os.path.dirname(self.path))
-            if web:
-                res = self.daily_chat_web(trigger=None)
-                result["web"] = res
-                web_ok = bool(res.get("ok"))
-                if web_ok:
-                    # 重试过就把轮数带上：光看「成功」分不清是首轮就跑完，还是
-                    # 前几轮超时、多等了一轮才跑完（后者是慢，不是没跑）。
-                    tries = res.get("attempts") or 1
-                    retried = "（重试 %d 次后）" % (tries - 1) if tries > 1 else ""
-                    result["msg"] = ("每日活跃对话成功完成（网页通道%s %s：%d 段输出，%d ms）"
-                                     % (retried, res.get("status") or "completed",
-                                        res.get("chunks") or 0, res.get("elapsed_ms") or 0))
-                else:
-                    # 桌面腿成功不等于当天打卡完成：计入官方「每日活跃」的只有网页腿
-                    # （#75/#59/#90）。面板与活动历史按 ok 画成功/失败，网页腿失败却
-                    # 报成功的话，「今天这 30/50 积分没到账」在界面上一直看不见。
-                    tries = res.get("attempts") or 1
-                    suffix = "（已重试 %d 次）" % (tries - 1) if tries > 1 else ""
-                    result["ok"] = False
-                    result["error"] = "网页通道失败：%s%s" % (res.get("error"), suffix)
-                    result["msg"] = "每日活跃对话未完成（网页通道失败：%s%s）" % (
-                        res.get("error"), suffix)
-                    # 沙箱入口证书校验失败（#645）不属于「这一轮没跑完」，重试同一轮
-                    # 永远不会成功；而成长连登只需要一条 POST /v2/report 就能点亮。
-                    # 开关打开时改走活跃上报，把当天算完成（默认关，行为不变）。
-                    fallback_on = (bool(self.path)
-                                   and wb_settings.daily_chat_web_fallback_activity(
-                                       os.path.dirname(self.path)))
-                    if fallback_on and is_tls_verify_text(res.get("error")):
-                        fb = self.report_activity()
-                        result["web_fallback"] = fb
-                        if fb.get("ok"):
-                            web_ok = True
-                            result["ok"] = True
-                            result.pop("error", None)
-                            result["msg"] = (
-                                "每日活跃对话：网页通道证书校验失败，已回退对话活跃上报（%s）"
-                                % (fb.get("msg") or ""))
-            # 只有真正计入官方「每日活跃」的网页通道成功了才算今天做过：网页腿失败时
-            # 若照写 lastDailyChat，当天后续巡检会直接跳过该账号，那天的 30/50 积分静默
-            # 丢掉且不再重试。web=False（没开网页通道）时维持原语义：桌面腿成功即算完成。
-            if web_ok:
-                self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
-                if self.path and os.path.exists(os.path.dirname(self.path)):
-                    self.save(os.path.dirname(self.path))
-            return result
+            return {"ok": True, "msg": "每日活跃对话成功完成"}
         except urllib.error.HTTPError as exc:
             try:
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
-            return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
+            # Normal chat already treats 403/code 11140 as a persistent
+            # account ban. Daily activity used to bypass that path and therefore
+            # retried the same banned account at later scheduler slots. Mirror
+            # the existing governance here.
+            upstream_code = None
+            try:
+                body = json.loads(err or "{}")
+                upstream_code = body.get("code") if isinstance(body, dict) else None
+            except Exception:
+                pass
+            if exc.code == 403 and upstream_code == 11140:
+                self.note_restricted(detail=err)
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+                return {"ok": False, "restricted": True,
+                        "error": f"HTTP 403 / 11140: {err[:100]}"}
+            return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}",
+                    "retryable": _daily_chat_model_fallback_allowed(exc.code, err)}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "retryable": True}
+
+    def _daily_chat_web_step(self, result, web=None):
+        """Run the web leg once after the desktop leg succeeds."""
+        if web is None:
+            web = bool(self.path) and wb_settings.daily_chat_web(
+                os.path.dirname(self.path))
+        web_ok = True
+        if web:
+            res = self.daily_chat_web(trigger=None)
+            result["web"] = res
+            web_ok = bool(res.get("ok"))
+            if web_ok:
+                tries = res.get("attempts") or 1
+                retried = "（重试 %d 次后）" % (tries - 1) if tries > 1 else ""
+                result["msg"] = (
+                    "每日活跃对话成功完成（网页通道%s %s：%d 段输出，%d ms）"
+                    % (retried, res.get("status") or "completed",
+                       res.get("chunks") or 0, res.get("elapsed_ms") or 0))
+            else:
+                tries = res.get("attempts") or 1
+                suffix = "（已重试 %d 次）" % (tries - 1) if tries > 1 else ""
+                result["ok"] = False
+                result["error"] = "网页通道失败：%s%s" % (
+                    res.get("error"), suffix)
+                result["msg"] = "每日活跃对话未完成（网页通道失败：%s%s）" % (
+                    res.get("error"), suffix)
+                # 证书失败改走活跃上报：默认关闭，打开时只对证书类错误生效。
+                fallback_on = (bool(self.path)
+                               and wb_settings.daily_chat_web_fallback_activity(
+                                   os.path.dirname(self.path)))
+                if fallback_on and is_tls_verify_text(res.get("error")):
+                    fb = self.report_activity()
+                    result["web_fallback"] = fb
+                    if fb.get("ok"):
+                        web_ok = True
+                        result["ok"] = True
+                        result.pop("error", None)
+                        result["msg"] = (
+                            "每日活跃对话：网页通道证书校验失败，已回退对话活跃上报（%s）"
+                            % (fb.get("msg") or ""))
+        if web_ok:
+            self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+            if self.path and os.path.exists(os.path.dirname(self.path)):
+                self.save(os.path.dirname(self.path))
+        return result
 
     def checkin(self, trigger="unknown"):
         """国内版每日签到。
@@ -2696,6 +3119,19 @@ class Account(object):
         wb_activity.record_attempt(self, wb_activity.TASK_CHECKIN, trigger, res)
         return res
 
+    def _mark_checkin_done(self, state):
+        """记下「今天签过了」，供 can_checkin() 的当日闸门用。
+
+        already 只在当天还没有记录时才补写：保留当天真实签到时间（可能是 9 点
+        那轮定时器签的），不要被用户晚上又点一次覆盖成点击时刻。
+        """
+        today = time.strftime("%Y-%m-%d")
+        if state == "already" and str(self.last_checkin or "").startswith(today):
+            return
+        self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+
     def _checkin_upstream(self):
         """签到的实际请求；返回形状见 checkin。"""
         cfg = get_realm_config("cn")
@@ -2708,9 +3144,7 @@ class Account(object):
             msg = payload.get("msg") or "ok"
             state = checkin_state(code, msg)
             if state in ("checked", "already"):
-                self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-                if self.path and os.path.exists(os.path.dirname(self.path)):
-                    self.save(os.path.dirname(self.path))
+                self._mark_checkin_done(state)
                 return {"ok": True, "state": state, "code": code, "msg": msg,
                         "data": payload.get("data")}
             return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
@@ -2723,10 +3157,8 @@ class Account(object):
                 # 上游如果在今日已签到时返回 HTTP 400 且文案写「今天已签到」，
                 # 说明今日事实上已处于签到完成状态，按成功处理并记录时间。
                 state = checkin_state(code, msg)
-                if state == "already":
-                    self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-                    if self.path and os.path.exists(os.path.dirname(self.path)):
-                        self.save(os.path.dirname(self.path))
+                if state in ("checked", "already"):
+                    self._mark_checkin_done(state)
                     return {"ok": True, "state": state, "code": code, "msg": msg,
                             "data": body.get("data")}
                 return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
@@ -2859,6 +3291,41 @@ class Account(object):
             "status": acc.get("Status", 0),
         }
 
+    #: 上游 free/paid packages 的 PageSize 上限就是 200（传 500 直接回 400）。
+    PACKAGE_PAGE_SIZE = 200
+    #: 分页兜底上限：10 页 × 200 = 2000 条实例，正常账号一辈子也用不到。
+    PACKAGE_MAX_PAGES = 10
+
+    def _paged_packages(self, url, body, headers):
+        """按页把套餐实例拉全。
+
+        签到与成长计划每天各发一个 100 积分包，一个活跃号两三个月就能攒到 200 条
+        以上；只拉第一页会让后面的实例静默丢失——面板上就是「签到 28 天却看不到
+        任何记录」。任何一页失败只返回已经拿到的部分，不让整次刷新失败。
+        """
+        accounts = []
+        total = None
+        for page in range(1, self.PACKAGE_MAX_PAGES + 1):
+            body_page = dict(body, PageNumber=page, PageSize=self.PACKAGE_PAGE_SIZE)
+            try:
+                res = http_json(url, data=json.dumps(body_page).encode(), method="POST",
+                                headers=headers, timeout=20, proxy=self.proxy)
+            except Exception:
+                break
+            data = res.get("data") or {}
+            chunk = data.get("Accounts") or []
+            if total is None:
+                try:
+                    total = int(data.get("TotalCount"))
+                except (TypeError, ValueError):
+                    total = None
+            accounts.extend(chunk)
+            if len(chunk) < self.PACKAGE_PAGE_SIZE:
+                break
+            if total is not None and len(accounts) >= total:
+                break
+        return accounts
+
     def _fetch_credits_cn_detailed(self):
         cfg = get_realm_config(self.realm)
         headers = self.headers(purpose="billing")
@@ -2905,29 +3372,22 @@ class Account(object):
         summary_pkgs = s_data.get("Packages") or []
         pkg_codes = [p.get("PackageCode") for p in summary_pkgs if p.get("PackageCode")]
 
-        # 2. 免费包
+        # 2. 免费包：Status 必须带 0/1/2/3。
+        #    只查 [0]（有效）会把用光的实例全部滤掉：签到发的 100 积分包一被用完就
+        #    变 status=3，于是「签到 N 天」在明细里一条都看不到，「已用完/过期」这个
+        #    筛选永远是空的。实测同一个号：[0] 只回 5 条，[0,1,2,3] 回 89 条。
         free_accs = []
         if pkg_codes:
             free_url = base_billing + RESOURCE_FREE_PACKAGES_PATH
-            body = {"PackageCodes": pkg_codes, "PageNumber": 1, "PageSize": 200, "Status": [0]}
-            try:
-                f_res = http_json(free_url, data=json.dumps(body).encode(), method="POST",
-                                  headers=headers, timeout=15, proxy=self.proxy)
-                free_accs = (f_res.get("data") or {}).get("Accounts") or []
-            except Exception:
-                pass
+            free_accs = self._paged_packages(
+                free_url, {"PackageCodes": pkg_codes, "Status": [0, 1, 2, 3]}, headers)
 
         # 3. 付费包
         paid_accs = []
         if pkg_codes:
             paid_url = base_billing + RESOURCE_PAID_PACKAGES_PATH
-            body = {"PackageCodes": pkg_codes, "PageNumber": 1, "PageSize": 200, "Status": [0, 3], "NeedRenewInfo": True}
-            try:
-                p_res = http_json(paid_url, data=json.dumps(body).encode(), method="POST",
-                                  headers=headers, timeout=15, proxy=self.proxy)
-                paid_accs = (p_res.get("data") or {}).get("Accounts") or []
-            except Exception:
-                pass
+            paid_accs = self._paged_packages(
+                paid_url, {"PackageCodes": pkg_codes, "Status": [0, 3], "NeedRenewInfo": True}, headers)
 
         # 4. 每日签到状态
         checkin_info = None
@@ -2961,12 +3421,15 @@ class Account(object):
         tot_used = sum(p["used"] for p in packages)
         tot_size = sum(p["size"] for p in packages)
 
-        # 若具体包为空且 summary 含有汇总容量，则使用 summaryPkgs
-        if not packages and summary_pkgs:
-            for sp in summary_pkgs:
-                tot_size += float(sp.get("CycleTotalCapacity") or 0)
-                tot_remain += float(sp.get("CycleRemainCapacity") or 0)
-                tot_used += float(sp.get("CycleUsedCapacity") or 0)
+        # 汇总口径：明细列表只是"上游还愿意返回的实例"，签到的 100 积分包用完就变成
+        # status=3 并逐渐被上游回收，对这些实例求和会得到远小于真实累计的数字
+        # （实测同一时刻：列表求和 900 / 500，官方 summary 累计 8863 / 8465）。
+        # resource-summary 的 Packages[] 才是累计值，拿得到就以它为准。
+        sum_size = sum(float(sp.get("CycleTotalCapacity") or 0) for sp in summary_pkgs)
+        sum_used = sum(float(sp.get("CycleUsedCapacity") or 0) for sp in summary_pkgs)
+        sum_remain = sum(float(sp.get("CycleRemainCapacity") or 0) for sp in summary_pkgs)
+        if sum_size > 0:
+            tot_size, tot_used, tot_remain = sum_size, sum_used, sum_remain
 
         tot_remain = round(tot_remain, 2)
         tot_used = round(tot_used, 2)
@@ -3265,8 +3728,8 @@ class Account(object):
             # 企业空间的 IsPaidUser 语义未验证（#505），先按「未知」处理。
             # 静态 Key 的个人计费摘要端点直接 401，同样按未知处理。
             return None
-        if self.restricted_until > time.time():
-            # 账号正被上游限制：这时再打计费接口只会继续喂风控。
+        if self.account_banned:
+            # 账号已被上游封禁：这时再打计费接口只会继续喂风控。
             return None
         if headers is None:
             headers = self.headers(purpose="billing")
@@ -3382,7 +3845,7 @@ class Account(object):
             self.cooldown_until = time.time() + actual_cooldown
 
     def note_restricted(self, detail="", cooldown=None):
-        """上游账号级风控限制（403 / code 11140）：按小时冷却，且不随重启消失。
+        """上游账号级封禁（403 / code 11140）：直接禁用，且不自动恢复。
 
         实测正文：{"code":11140,"msg":"request illegal",...,"displayMsg":
         「账号存在异常行为，已被限制使用」}。官方客户端同样报这个错，说明是
@@ -3391,21 +3854,20 @@ class Account(object):
         给出的处置口径是：看到 11140 立即停手，解封前严禁换号继续打同一台设备，
         否则设备指纹会连坐。
 
-        与普通冷却的区别：
-        - 固定 2 小时（可用 cooldown 覆盖），不吃 single_account 的 3 秒兜底——
-          把被限制的账号每 3 秒再试一次，只会继续喂上游风控；
-        - 持久化到凭据档（restrictedUntil）：重启 / 刷新 token / 换身分 /
-          「一键测试」都不会把它清掉，只有真正成功一次（说明上游已解除）才清。
+        与普通冷却的区别：没有到期时间，也不参与自动恢复。命中的账号会立即
+        关闭 API 派发与自动任务并持久化；重启 / 刷新 token / 换身分 /「一键
+        测试」都不会把它放回池子。官方解封后，由操作者在面板手动启用。
         """
-        now = time.time()
-        wait = RESTRICTED_ACCOUNT_COOLDOWN if cooldown is None else float(cooldown)
         with self._throttle_lock:
-            self.last_error = "HTTP 403 (account restricted)"
+            self.last_error = "HTTP 403 (account banned)"
             self.last_error_detail = str(detail)[:2000] if detail else ""
-            # 第一次命中才起算：反复探测/重试不该把 2 小时越推越长。
-            if self.restricted_until <= now:
-                self.restricted_until = now + max(1.0, wait)
-        return self.restricted_until
+            self.enabled = False
+            self.tasks_enabled = False
+            self.account_banned = True
+            if not self.banned_at:
+                self.banned_at = time.time()
+            self.restricted_until = 0.0
+        return 0.0
 
     def note_balance_cooled(self, message="insufficient credits"):
         """402 / out of credits: park until the next local 04:00.
@@ -3523,11 +3985,6 @@ class Account(object):
     def note_success(self, model=None):
         """A served request clears every account-level penalty.
 
-        That includes a persisted upstream restriction: a request that actually
-        succeeded is the one piece of evidence that the vendor lifted it. (In
-        normal dispatch a restricted account is never picked, so this only fires
-        from a manual test.)
-
         It also lifts the `token_expired` park. A response the upstream really
         served is direct proof that the credential still works, yet that flag is
         process-local and only ever cleared by a successful refresh, a re-login
@@ -3549,7 +4006,6 @@ class Account(object):
             self.last_soft_at = 0.0
             self.breaker_until = 0.0
             self.degrade_until = 0.0
-            self.restricted_until = 0.0
             self.last_error = ""
             self.last_error_detail = ""
             self.cooldown_until = 0.0
@@ -3557,13 +4013,13 @@ class Account(object):
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
-        if not self.enabled or not self.access_token:
+        if self.account_banned or not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
         with self._throttle_lock:
             wait = max(0.0, self.cooldown_until - now,
                        self.balance_until - now, self.breaker_until - now,
-                       self.degrade_until - now, self.restricted_until - now)
+                       self.degrade_until - now)
             if model:
                 wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
         return wait
@@ -3596,9 +4052,20 @@ class Account(object):
                 self.last_error_detail = ""
                 self.cooldown_until = 0
                 self.balance_until = 0.0
-            # 上游账号级风控限制（restricted_until）故意不在这里清：它不是本机
-            # 记的限流窗口，而是上游对账号的标记；换身分 / 重试 / 刷新都不该把
+            # 上游账号封禁（account_banned）故意不在这里清：它不是本机记的
+            # 限流窗口，而是上游对账号的标记；换身分 / 重试 / 刷新都不该把
             # 它放回池子（见 note_restricted）。
+
+    def clear_account_ban(self):
+        """操作者手动启用账号时解除上游封禁标记。
+
+        这是封禁唯一的解除入口。`clear_error()`、成功请求、token 刷新、重启
+        和导入都不能调用它。
+        """
+        with self._throttle_lock:
+            self.account_banned = False
+            self.banned_at = 0.0
+            self.restricted_until = 0.0
 
     def clear_model_cooldown(self, model):
         """只解除某个模型的限流，账号级状态原样保留。
@@ -3655,6 +4122,41 @@ def _human_delta(seconds):
     return "%d min" % int(seconds / 60)
 
 
+AUTH_CHALLENGE_MARK = "www-authenticate: "
+
+
+def auth_challenge(headers):
+    """The `WWW-Authenticate` value of a 401, whitespace-collapsed and bounded.
+
+    Gateways such as APISIX answer a dead token with an HTML page whose reason
+    lives only in this header (`Bearer realm="copilot", error="invalid_token"`).
+    Reading it is what separates "the credential is bad" from "a proxy page
+    answered", which the body alone cannot tell apart.
+    """
+    try:
+        value = headers.get("www-authenticate") if headers else ""
+    except Exception:
+        return ""
+    return " ".join(str(value or "").split())[:160]
+
+
+def http_error_message(exc, detail, limit=None):
+    """Diagnosis string for an HTTPError: `HTTP <code>: <body>`, plus the challenge.
+
+    The challenge goes *before* the body on purpose. Callers truncate the label
+    (80/150 chars) and `note_error` keeps only 200, so a header appended at the
+    end would be the first thing cut - exactly the evidence that matters.
+    """
+    body = str(detail or "")
+    if limit:
+        body = body[:limit]
+    code = getattr(exc, "code", "")
+    challenge = auth_challenge(getattr(exc, "headers", None))
+    if not challenge:
+        return "HTTP %s: %s" % (code, body)
+    return "HTTP %s (%s%s): %s" % (code, AUTH_CHALLENGE_MARK, challenge, body)
+
+
 def _auth_failure_text(text):
     """True for a credential-shaped 401, not an intermediate proxy page.
 
@@ -3662,12 +4164,20 @@ def _auth_failure_text(text):
     that the token is dead: parking the account on it would take a healthy
     credential out of rotation until a manual re-login (#435). Only mark the
     account when the failure itself names authorization.
+
+    RFC 6750 `error="invalid_token"` is such a naming, and it outranks the HTML
+    bail-out: APISIX (copilot.tencent.com) rejects a dead token with an HTML
+    page and puts the reason in `WWW-Authenticate`, so the body alone looks
+    exactly like a proxy page while the header says the credential is bad.
+    `http_error_message()` keeps that header in the diagnosis string.
     """
     lower = str(text or "").lower()
+    if "invalid_token" in lower or "invalid-token" in lower:
+        return True
     if "<html" in lower:
         return False
     return ("401" in lower or "unauthorized" in lower or "authorization" in lower
-            or "token expired" in lower or "invalid_token" in lower)
+            or "token expired" in lower)
 
 
 def _human_left(seconds):
@@ -3957,6 +4467,8 @@ class AccountPool(object):
         self.log = log or (lambda msg: None)
         self.accounts = []
         self.logins = {}
+        # Slots picked by a login whose auth/state request is still in flight.
+        self._login_slot_reserved = set()
         self._lock = threading.RLock()
         self._cursor = 0
         # Smooth weighted round-robin state for the expiring-credits window,
@@ -4053,6 +4565,16 @@ class AccountPool(object):
                     continue
                 if account.arm_model_cooldown(model, row.get("reset_at")):
                     restored.setdefault(uid, []).append(model)
+                # 这条窗口是上游判定额度用满（6004）时，把撞线时刻一起挂回来：
+                # 面板据此显示"配额耗尽"而不是"临时限流"，重启后也不丢这个
+                # 事实（凭证档的 model_caps 只覆盖免费模型，issue #668）。
+                if row.get("cap"):
+                    try:
+                        cap_at = float(row.get("cap_at") or 0.0)
+                    except (TypeError, ValueError):
+                        cap_at = 0.0
+                    if cap_at:
+                        account.model_cap_marks[model] = cap_at
         for uid, mids in sorted(restored.items()):
             self.log("account %s: 模型 %s 仍在上游限流窗口内（重启后按窗口恢复）"
                      % (uid[:8], ", ".join(mids)))
@@ -4075,6 +4597,13 @@ class AccountPool(object):
             if existing is not None:
                 account.added_at = existing.added_at
                 account.path = existing.path
+                # Re-login / re-import must not bypass an upstream ban:
+                # only an explicit operator enable clears it.
+                if getattr(existing, "account_banned", False):
+                    account.account_banned = True
+                    account.banned_at = existing.banned_at
+                    account.enabled = False
+                    account.tasks_enabled = False
                 if not account.credits and existing.credits:
                     account.credits = existing.credits
                 # 重新登录 / 扫码换 token 不该丢掉已经读到的档位（#505）。
@@ -4196,6 +4725,7 @@ class AccountPool(object):
                                  if tasks_enabled is not None
                                  else bool(enabled))
         if enabled:
+            account.clear_account_ban()
             account.clear_error()
         account.save(self.dir)
         self.apply_proxy_slots()
@@ -4231,6 +4761,15 @@ class AccountPool(object):
         if account is None:
             return None
         account.note = str(note or "").strip()[:200]
+        account.save(self.dir)
+        return account.public()
+
+    def set_group(self, uid, group):
+        """Set the optional operator label used for filtering and batch actions."""
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.group = str(group or "").strip()[:64]
         account.save(self.dir)
         return account.public()
 
@@ -4279,7 +4818,7 @@ class AccountPool(object):
                 else:
                     account.proxy = account.proxy_legacy
 
-    def apply_reserve_credits(self, values=None):
+    def apply_reserve_credits(self, values=None, free_models=None):
         """Re-resolve the low-credit guard for every account.
 
         Same shape as apply_proxy_slots(): settings.json is the source of
@@ -4287,7 +4826,8 @@ class AccountPool(object):
         needs no extra settings lookup. `values` is the guard resolved per
         realm ({"global": g, "intl": ..., "cn": ...}); each account picks its
         own realm, so a per-realm override lands only on that realm's accounts
-        while the global default keeps covering both.
+        while the global default keeps covering both. `free_models` is the
+        caller's realm -> free-id catalogue view; None retains the last one.
         """
         import wb_settings
 
@@ -4296,6 +4836,9 @@ class AccountPool(object):
         with self._lock:
             for account in self.accounts:
                 account.reserve_credits = _realm_limit(values, account.realm)
+                if free_models is not None:
+                    account.free_models = frozenset(
+                        free_models.get(account.realm) or ())
         return values
 
     def apply_expiring_window(self, values=None):
@@ -4470,9 +5013,54 @@ class AccountPool(object):
                 account.enabled = bool(enabled)
                 account.tasks_enabled = bool(enabled)
                 if enabled:
+                    account.clear_account_ban()
                     account.clear_error()
                 account.save(self.dir)
         self.apply_proxy_slots()
+
+    def set_enabled_many(self, uids, enabled):
+        """Enable/disable exactly the selected accounts.
+
+        The panel's checkbox selection is an explicit operator choice, so this
+        must not widen to a group or the whole pool when a UID is missing.
+        Callers validate missing UIDs before calling; this method only applies
+        the requested set and returns the accounts that were changed.
+        """
+        wanted = {str(uid) for uid in uids if uid}
+        changed = []
+        with self._lock:
+            for account in self.accounts:
+                if str(account.uid) not in wanted:
+                    continue
+                account.enabled = bool(enabled)
+                account.tasks_enabled = bool(enabled)
+                if enabled:
+                    account.clear_account_ban()
+                    account.clear_error()
+                account.save(self.dir)
+                changed.append(account.uid)
+        self.apply_proxy_slots()
+        return changed
+
+    def set_group_enabled(self, group, enabled):
+        """Enable/disable exactly the accounts carrying one non-empty group."""
+        group = str(group or "").strip()
+        if not group:
+            return []
+        changed = []
+        with self._lock:
+            for account in self.accounts:
+                if account.group != group:
+                    continue
+                account.enabled = bool(enabled)
+                account.tasks_enabled = bool(enabled)
+                if enabled:
+                    account.clear_account_ban()
+                    account.clear_error()
+                account.save(self.dir)
+                changed.append(account.uid)
+        self.apply_proxy_slots()
+        return changed
 
     def task_accounts(self, realm=None):
         """Accounts that participate in scheduled / manual tasks.
@@ -4485,15 +5073,53 @@ class AccountPool(object):
             return [a for a in self.accounts
                     if (not realm or a.realm == realm) and a.task_active()]
 
-    def count_ready(self, realm=None, model=None, allowed=None):
+    def set_pool_scope(self, uid, scope):
+        """Set one account's dispatch pool and persist it."""
+        scope = wb_pool_scope.normalize_scope(scope, default=None)
+        if scope is None:
+            return None
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.pool_scope = scope
+        account.save(self.dir)
+        return account.public()
+
+    def set_pool_scope_many(self, uids, scope):
+        """Move several accounts between pools; returns the uids actually moved."""
+        scope = wb_pool_scope.normalize_scope(scope, default=None)
+        if scope is None:
+            return None
+        moved = []
+        for uid in uids:
+            account = self.get(uid)
+            if account is None:
+                continue
+            account.pool_scope = scope
+            account.save(self.dir)
+            moved.append(uid)
+        return moved
+
+    def count_ready(self, realm=None, model=None, allowed=None, refresh=True,
+                    scope=None):
+        """How many accounts can serve right now.
+
+        `refresh=False` keeps the count read-only: `Account.ready()` normally
+        refreshes a credential that is about to expire, and a probe that asks
+        "how many accounts are left" must not turn into a network call per
+        model (issue #667).
+        """
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if scope is not None:
+            snapshot = [a for a in snapshot if wb_pool_scope.in_scope(a, scope)]
         return sum(1 for a in snapshot
-                   if a.enabled and a.access_token and a.ready(model=model)
+                   if a.enabled and a.access_token
+                   and a.ready(model=model, refresh=refresh)
                    and (allowed is None or a.uid in allowed))
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
-                         page=None, allowed=None):
+                         page=None, allowed=None, scope=None):
         """Pick the account for one turn of a conversation.
 
         Three shapes, in order of preference:
@@ -4511,7 +5137,22 @@ class AccountPool(object):
           every oversized body onto a single account.
         """
         exclude = exclude or set()
-        if session_key and page is None:
+        # A page that covers the whole realm is not a page at all: every
+        # oversized conversation would rotate through the entire pool and lose
+        # its prefix cache every turn (issue #718). Bind it like a normal
+        # conversation instead; real multi-page pools keep rotating.
+        whole_pool_page = False
+        if page is not None:
+            with self._lock:
+                pool_size = sum(1 for a in self.accounts
+                                if (not realm or a.realm == realm)
+                                and (scope is None
+                                     or wb_pool_scope.in_scope(a, scope)))
+            try:
+                whole_pool_page = int(page[1]) >= pool_size
+            except (TypeError, ValueError, IndexError):
+                whole_pool_page = False
+        if session_key and (page is None or whole_pool_page):
             for uid in self.affinity.recent(session_key):
                 if uid in exclude:
                     continue
@@ -4521,27 +5162,33 @@ class AccountPool(object):
                 if allowed is not None and uid not in allowed:
                     continue
                 account = self.get(uid)
+                if scope is not None and not wb_pool_scope.in_scope(account, scope):
+                    account = None
                 if account and account.realm == realm and account.ready(model=model):
                     self.affinity.bind(session_key, uid)
                     return account
-        account = self.pick(realm=realm, exclude=exclude, model=model, page=page,
-                            allowed=allowed)
+        account = self.pick(realm=realm, exclude=exclude, model=model,
+                            page=None if whole_pool_page else page,
+                            allowed=allowed, scope=scope)
         if account is None and page is not None:
             # The page has nobody usable right now. Serving the conversation
             # from outside it beats not serving it at all.
             account = self.pick(realm=realm, exclude=exclude, model=model,
-                                allowed=allowed)
+                                allowed=allowed, scope=scope)
         # A page conversation is not bound on purpose: its rotation is what keeps
         # every account of the page warm, and a binding would pin it back to one
         # (the state it was released from). The page cursor carries its rotation.
-        if account and session_key and page is None:
+        if account and session_key and (page is None or whole_pool_page):
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None):
+    def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None,
+             scope=None):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if scope is not None:
+            snapshot = [a for a in snapshot if wb_pool_scope.in_scope(a, scope)]
         if allowed is not None:
             snapshot = [a for a in snapshot if a.uid in allowed]
         if page is not None:
@@ -4621,18 +5268,47 @@ class AccountPool(object):
     def _expiry_weight(self, account):
         """How much of the window's traffic this account should take.
 
-        Linear in how close the credits are to lapsing, floored at 1 so an
-        account at the far edge of the window still gets served rather than
-        starved until the others run dry.
+        Two factors, multiplied, floored at 1 so an account at the far edge of
+        the window still gets served rather than starved until the others run
+        dry:
+
+          * urgency - how close the soonest-lapsing package is. Kept as a
+            fraction of the window rather than a rounded day count, because
+            rounding collapsed the whole 0-1.4 day range onto one weight and
+            that is exactly where a real pool sits: on the live pool 110 of
+            112 accounts reported days_left 0.10 and every one of them got the
+            same weight, so the preference degraded into a plain rotation.
+
+          * amount - how much of the lapsing package is still unspent. This is
+            the part that actually gets "spent before it expires": an account
+            holding 30 expiring credits is worth 30x the traffic of one holding
+            1, and the old weight ignored the figure entirely. Logarithmic, so
+            a 30-vs-1 gap does not turn into a 30x share that starves everyone
+            else, and floored at 1 so a nearly-spent package still counts.
+
+        A pool where nobody can be judged keeps the plain rotation: an unknown
+        soonest-expiring day yields weight 1, and equal weights degenerate to
+        a plain rotation in `_smooth_weighted_pick`.
         """
         try:
-            window = int(account.expiring_window_days or 0)
+            window = float(account.expiring_window_days or 0)
         except (TypeError, ValueError):
-            window = 0
+            window = 0.0
         days = account.soonest_expiring_days()
         if days is None:
             return 1
-        return max(1, int(round(window - days)) + 1)
+        # urgency: 1 at the far edge of the window, growing to ~1+1/scale at 0
+        if window <= 0:
+            return 1
+        remaining_fraction = max(0.0, min(1.0, 1.0 - (float(days) / window)))
+        urgency = 1.0 + remaining_fraction
+        # amount: log-scaled so 30 credits is not a 30x share of the traffic
+        amount = account.soonest_expiring_remain()
+        if amount is None or amount <= 0:
+            amount_weight = 1.0
+        else:
+            amount_weight = 1.0 + math.log10(1.0 + float(amount))
+        return max(1, int(round(urgency * amount_weight * EXPIRY_WEIGHT_SCALE)))
 
     def _pick_remaining_first(self, snapshot, exclude, model):
         """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。
@@ -4793,9 +5469,12 @@ class AccountPool(object):
                 return account
         return None
 
-    def representative(self, realm=None):
+    def representative(self, realm=None, scope=None):
         with self._lock:
             candidates = [a for a in self.accounts if not realm or a.realm == realm]
+            if scope is not None:
+                candidates = [a for a in candidates
+                              if wb_pool_scope.in_scope(a, scope)]
             for account in candidates:
                 if account.access_token: return account
             return candidates[0] if candidates else None
@@ -4830,7 +5509,56 @@ class AccountPool(object):
             return None, "is ambiguous"
         return None, "was not found"
 
-    def start_login(self, realm="intl", platform="CLI"):
+    def _login_proxy(self, slot_id=None, taken_slots=()):
+        """Resolve the egress used by one OAuth login (start + poll).
+
+        Order: explicit slot id > LOGIN_SLOT_AUTO (a random enabled slot that
+        is not bound to an account - here or in `taken_slots`, the caller's
+        other pools such as CodeArts - and not held by another pending login). Nothing given means direct, exactly as before
+        this option existed - configured slots are only used when asked for.
+        Random rather than list order, so new accounts spread over the free
+        exits instead of always taking the head of the list.
+        Returns (slot_id, proxy_url); ("", "") means direct. An auto-picked
+        slot is reserved until start_login records (or drops) its state, so two
+        concurrent logins cannot pick the same slot; logins past their TTL no
+        longer hold one.
+        """
+        wanted = str(slot_id or "").strip()
+        if not wanted:
+            return "", ""
+        slots = [s for s in wb_settings.proxy_slots(self.dir) if s.get("enabled")]
+        for s in slots:
+            if s["id"] == wanted:
+                return s["id"], s["url"]
+        if wanted != LOGIN_SLOT_AUTO:
+            raise LoginProxySlotError(
+                "proxy slot %s does not exist or is disabled" % wanted)
+        now = time.time()
+        with self._lock:
+            taken = {a.proxy_slot for a in self.accounts if a.proxy_slot}
+            taken |= {str(t) for t in (taken_slots or ()) if t}
+            taken |= {str(i.get("proxy_slot") or "") for i in self.logins.values()
+                      if now - i.get("created", 0) <= LOGIN_TTL_SECONDS}
+            taken |= self._login_slot_reserved
+            free = [s for s in slots if s["id"] not in taken]
+            if not free:
+                return "", ""
+            pick = random.choice(free)
+            self._login_slot_reserved.add(pick["id"])
+        return pick["id"], pick["url"]
+
+    def start_login(self, realm="intl", platform="CLI", proxy_slot=None,
+                    taken_slots=()):
+        auto_slot = str(proxy_slot or "").strip() == LOGIN_SLOT_AUTO
+        slot_id, proxy_url = self._login_proxy(proxy_slot, taken_slots)
+        try:
+            return self._start_login(realm, platform, slot_id, proxy_url, auto_slot)
+        finally:
+            if auto_slot and slot_id:  # explicit picks never reserved anything
+                with self._lock:
+                    self._login_slot_reserved.discard(slot_id)
+
+    def _start_login(self, realm, platform, slot_id, proxy_url, auto_slot):
         cfg = get_realm_config(realm)
         url = "%s%s?platform=%s" % (cfg["chat_upstream"], AUTH_STATE_PATH, urllib.parse.quote(str(platform)))
         headers = {
@@ -4842,15 +5570,18 @@ class AccountPool(object):
             "Referer": cfg["origin"] + "/",
         }
         payload = http_json(url, data=b"{}", method="POST", headers=headers,
-                            timeout=30, retries=3, log=self.log)
+                            timeout=30, retries=3, log=self.log, proxy=proxy_url)
         data = payload.get("data") or {}
         state = data.get("state")
         auth_url = data.get("authUrl")
         if not state or not auth_url:
             raise RuntimeError("auth/state returned no state/authUrl: %s" % payload)
         with self._lock:
-            self.logins[state] = {"created": time.time(), "platform": platform, "realm": realm}
-        return {"state": state, "authUrl": auth_url, "realm": realm, "platform": platform}
+            self.logins[state] = {"created": time.time(), "platform": platform,
+                                  "realm": realm, "proxy_slot": slot_id,
+                                  "proxy": proxy_url, "auto_slot": auto_slot}
+        return {"state": state, "authUrl": auth_url, "realm": realm,
+                "platform": platform, "proxySlot": slot_id, "proxy": proxy_url}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -4862,6 +5593,7 @@ class AccountPool(object):
             with self._lock: self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("realm") or "intl"
+        proxy_url = info.get("proxy") or ""
         cfg = get_realm_config(realm)
         url = "%s%s?state=%s" % (cfg["chat_upstream"], AUTH_TOKEN_PATH, urllib.parse.quote(state))
         headers = {
@@ -4873,7 +5605,8 @@ class AccountPool(object):
             "Referer": cfg["origin"] + "/",
         }
         try:
-            payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2)
+            payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2,
+                                proxy=proxy_url)
         except Exception as exc:
             return {"status": "pending", "message": "poll error: %s" % exc}
         code = payload.get("code")
@@ -4886,13 +5619,24 @@ class AccountPool(object):
         if not token:
             return {"status": "pending", "message": "waiting for token"}
         uid = jwt_uid(token)
+        slot_id = info.get("proxy_slot") or ""
+        if info.get("auto_slot"):
+            # Re-login of a bound account keeps its exit; the auto pick only
+            # served this login (add() keeps the existing slot when ours is "").
+            with self._lock:
+                existing = self.get(uid)
+            if existing is not None and existing.proxy_slot:
+                slot_id = ""
         nickname = ""
         try:
             acct_url = "%s%s?state=%s" % (cfg["chat_upstream"], LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
             acct_headers = dict(headers)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = urllib.request.Request(acct_url, method="GET", headers=acct_headers)
-            with urllib.request.urlopen(req_acct, timeout=15) as resp_acct:
+            # Direct logins keep the exact pre-slot path (plain urllib).
+            opened = (urlopen(req_acct, timeout=15, proxy=proxy_url) if proxy_url
+                      else urllib.request.urlopen(req_acct, timeout=15))
+            with opened as resp_acct:
                 profile = json.loads(resp_acct.read().decode("utf-8"))
                 profile_data = profile.get("data") or {}
                 nickname = str(profile_data.get("nickname") or "")
@@ -4908,6 +5652,10 @@ class AccountPool(object):
             "expiresAt": normalize_epoch(data.get("expiresAt")) or jwt_exp(token),
             "source": "oauth",
             "enabled": True,
+            # Only the slot id is stored; copying its URL into the legacy
+            # "proxy" field would keep the account on it after the slot is
+            # removed/disabled.
+            "proxySlot": slot_id,
         })
         self.add(account)
         if realm == "cn":
@@ -5155,6 +5903,8 @@ RUNTIME_ONLY_FIELDS = ("lastError", "cooldownUntil")
 def account_to_export(account):
     """Serialise one account for an export document."""
     data = account.to_dict()
+    if account.device_token:
+        data["deviceToken"] = account.device_token
     # Keep the credential and identity; drop nothing, but mark the file source
     # so a re-import on the same machine does not look like a desktop import.
     data.pop("path", None)
@@ -5182,6 +5932,7 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
         if not include_secrets:
             row.pop("accessToken", None)
             row.pop("refreshToken", None)
+            row.pop("deviceToken", None)
         rows.append(row)
     return {
         "format": EXPORT_FORMAT,
@@ -5312,9 +6063,11 @@ def normalise_import_row(row, realm=None):
         "enterpriseId": str(pick("enterpriseId") or ""),
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),
+        "deviceToken": str(pick("deviceToken") or pick("device_token") or "").strip(),
         "expiresAt": (0 if api_key
                       else normalize_epoch(pick("expiresAt")) or jwt_exp(token)),
         "source": str(pick("source") or (SOURCE_API_KEY if api_key else "import")),
+        "group": str(pick("group") or "").strip()[:64],
         "enabled": True,
         # Imported accounts start with tasks on (they are new to this pool);
         # an export that carries the flag keeps the operator's choice.

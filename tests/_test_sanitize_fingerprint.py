@@ -209,75 +209,6 @@ class DshGuiParagraphTests(unittest.TestCase):
         self.assertIn("whose URL is named in the runtime context", system)
 
 
-class DshPathGuidanceTests(unittest.TestCase):
-    """DSH 默认路径说明的连续两句触发 11128，拆开发送则正常。"""
-
-    FIRST = "Tokens prefixed with @ are paths the user explicitly referenced."
-    SECOND = ("Relative paths resolve from the workspace root; absolute paths "
-              "identify files or directories on the host.")
-    CLEAN = "Tokens starting with @ are paths the user explicitly referenced."
-    PAIR = FIRST + " " + SECOND
-
-    def test_paragraph_reworded_without_losing_path_rules(self):
-        suffix = (' A trailing slash marks a directory: list it when its contents matter. '
-                  '@"..." quotes a path containing spaces.')
-        self.assertEqual(P.sanitize_text(self.PAIR + suffix),
-                         self.CLEAN + " " + self.SECOND + suffix)
-
-    def test_individually_accepted_sentences_untouched(self):
-        for text in (self.FIRST, self.SECOND,
-                     self.FIRST + " Relative paths may use another root."):
-            with self.subTest(text=text):
-                self.assertEqual(P.sanitize_text(text), text)
-                self.assertFalse(P.has_fingerprint(text))
-
-    def test_case_insensitive_and_idempotent(self):
-        for text in (self.PAIR.lower(), self.PAIR.upper(), self.PAIR):
-            with self.subTest(text=text):
-                self.assertTrue(P.has_fingerprint(text))
-                clean = P.sanitize_text(text)
-                self.assertEqual(clean, self.CLEAN + text[len(self.FIRST):])
-                self.assertEqual(P.sanitize_text(clean), clean)
-                self.assertFalse(P.has_fingerprint(clean))
-
-    def test_scoped_to_instruction_roles(self):
-        roles = ("system", "developer", "assistant", "user", "tool", "function")
-        out = P.sanitize_messages([{"role": role, "content": self.PAIR}
-                                   for role in roles])
-        for role, message in zip(roles, out):
-            with self.subTest(role=role):
-                expected = (self.CLEAN + " " + self.SECOND
-                            if role in ("system", "developer", "assistant")
-                            else self.PAIR)
-                self.assertEqual(message["content"], expected)
-
-    def test_content_parts_preserve_images(self):
-        image = {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
-        content = [{"type": "text", "text": self.PAIR}, image]
-        out = P.sanitize_messages([{"role": "system", "content": content}])
-        self.assertEqual(out[0]["content"][0]["text"], self.CLEAN + " " + self.SECOND)
-        self.assertEqual(out[0]["content"][1], image)
-        self.assertEqual(content[0]["text"], self.PAIR)
-
-    def test_wire_body_keeps_user_and_tool_data(self):
-        args = json.dumps({"text": self.PAIR})
-        body = P.build_upstream_body({
-            "model": "deepseek-v4.1-flash",
-            "messages": [
-                {"role": "system", "content": self.PAIR},
-                {"role": "user", "content": self.PAIR},
-                {"role": "assistant", "content": None, "tool_calls": [{
-                    "id": "call_path", "type": "function",
-                    "function": {"name": "check_path", "arguments": args}}]},
-                {"role": "tool", "tool_call_id": "call_path", "content": self.PAIR},
-            ]})
-        messages = body["messages"]
-        self.assertEqual(messages[0]["content"], self.CLEAN + " " + self.SECOND)
-        self.assertEqual(messages[1]["content"], self.PAIR)
-        self.assertEqual(messages[2]["tool_calls"][0]["function"]["arguments"], args)
-        self.assertEqual(messages[3]["content"], self.PAIR)
-
-
 class AssistantHistoryFingerprintTests(unittest.TestCase):
     """#574：assistant 历史里的身份句 / 品牌 + GUI 组合。
 
@@ -376,6 +307,389 @@ class IdentityVerbVariantsTests(unittest.TestCase):
         self.assertEqual(out[0]["content"], self.CLEAN)
         self.assertEqual(out[1]["content"], self.CLEAN)
         self.assertEqual(out[2]["content"], fp)
+
+
+class DshFileReferenceParagraphTests(unittest.TestCase):
+    """DSH 系统提示里「@ 文件引用说明段」的渠道指纹。
+
+    DeepSeek Harness 的官方插件 `@deepseek-ai/dsh-file-reference`
+    （packages/context/file-reference）会往系统提示里注入 FILE_REFERENCE_PROMPT。
+    这一段被上游当成「非官方客户端」的特征，回 400 / code 11-128
+    （displayTips：这次调用没通过渠道校验）。
+
+    2026-10-28 在本机 CN 号池实测，用来定指纹边界（不是猜）：
+
+        · 只发 A+B 两句 → 200
+        · 整段五句连排 → 400，稳定复现
+        · 整段里 A 句补一个 `that` → 200
+
+    也就是说匹配单位是**整段连续文本**：截前两句测会误判成「已修复」，
+    改 A 句一个词就能让它失配。修法因此取最小改动——只在 A 句补一个 `that`，
+    一个词不多不少，B 句及其后所有句子原样保留，语义完全不变；负向前瞻
+    (?!that ) 保证幂等。作用域与 GUI 段同口径：system / developer / assistant，
+    user / tool 里的同句属用户数据不改写（#537）。
+    """
+
+    A = "Tokens prefixed with @ are paths the user explicitly referenced."
+    A_FIXED = "Tokens prefixed with @ are paths that the user explicitly referenced."
+    B = ("Relative paths resolve from the workspace root; absolute paths identify "
+         "files or directories on the host.")
+    TAIL = (" A trailing slash marks a directory: list it when its contents matter. "
+            "Anything else is a file: use the read tool when its contents are needed, "
+            "and do not claim to have inspected it before reading. "
+            "@\"...\" quotes a path containing spaces.")
+    PARA = A + " " + B + TAIL
+    PARA_FIXED = A_FIXED + " " + B + TAIL
+
+    def test_full_paragraph_rewritten(self):
+        self.assertEqual(P.sanitize_text(self.PARA), self.PARA_FIXED)
+
+    def test_only_sentence_a_changes(self):
+        # B 句及其后所有句子必须逐字保留：改的是措辞，不是内容。
+        out = P.sanitize_text(self.PARA)
+        self.assertIn(self.B + self.TAIL, out)
+        self.assertNotIn(" are paths the user ", out)
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.PARA)
+        self.assertEqual(P.sanitize_text(once), once)
+        self.assertFalse(P.has_fingerprint(once))
+
+    def test_sentence_a_alone_rewritten(self):
+        # A 句单独出现时改写同样安全（只补一个词），不必等 B 句在场；
+        # 这样 DSH 换掉后半段措辞也不会让规则失效。
+        self.assertEqual(P.sanitize_text(self.A), self.A_FIXED)
+
+    def test_case_insensitive(self):
+        self.assertEqual(P.sanitize_text(self.PARA.lower()), self.PARA_FIXED.lower())
+
+    def test_embedded_in_system_prompt(self):
+        text = "You are a coding agent.\n\n" + self.PARA + "\n\nMore rules follow."
+        self.assertEqual(
+            P.sanitize_text(text),
+            "You are a coding agent.\n\n" + self.PARA_FIXED + "\n\nMore rules follow.")
+
+    def test_scoped_to_system_developer_and_assistant(self):
+        out = P.sanitize_messages([
+            {"role": "system", "content": self.PARA},
+            {"role": "developer", "content": self.PARA},
+            {"role": "assistant", "content": self.PARA},
+            {"role": "user", "content": self.PARA},
+            {"role": "tool", "content": self.PARA},
+        ])
+        for i in range(3):
+            self.assertEqual(out[i]["content"], self.PARA_FIXED, out[i]["role"])
+        # user / tool 里的同句是用户数据，改写会让模型看到与磁盘不一致的内容。
+        self.assertEqual(out[3]["content"], self.PARA)
+        self.assertEqual(out[4]["content"], self.PARA)
+
+    def test_unrelated_at_paths_untouched(self):
+        for text in ("mail me at foo@bar.com", "npm i @deepseek-ai/dsh",
+                     "see C:\\work\\@cache for details"):
+            self.assertEqual(P.sanitize_text(text), text)
+
+
+class CodexIntroFingerprintTests(unittest.TestCase):
+    """Codex 基础提示词首段（#743）。
+
+    旧规则把中性句改写成 ``You are a coding agent running in the Codex CLI
+    tool, ...``，而 ``SANITIZE_FEATURES`` 恰好在找 ``... running in the Codex
+    CLI``，于是 sanitize 之后 has_fingerprint() 仍为 True，出站 body 继续
+    11-128。这里钉住两件事：首段必须被中性化；改写必须是幂等的。
+    """
+
+    INTRO = ("You are a coding agent running in the Codex CLI, a terminal-based "
+             "coding assistant.")
+    INTRO_TOOL = ("You are a coding agent running in the Codex CLI tool, a "
+                  "terminal-based coding assistant.")
+    CLEAN = "You are a helpful AI assistant."
+
+    def test_codex_intro_is_neutralized(self):
+        for text in (self.INTRO, self.INTRO_TOOL):
+            self.assertTrue(P.has_fingerprint(text))
+            self.assertEqual(P.sanitize_text(text), self.CLEAN, text)
+            self.assertFalse(P.has_fingerprint(P.sanitize_text(text)))
+
+    def test_embedded_after_neutral_sentence_still_matches(self):
+        # 真实 Codex base_instructions 的形态：中性首句 + 自述句 + 后续段落。
+        text = ("You are a helpful AI assistant. " + self.INTRO +
+                "\n\nYour capabilities:\n\n- Receive user prompts.")
+        out = P.sanitize_text(text)
+        self.assertFalse(P.has_fingerprint(out))
+        self.assertIn("Your capabilities:", out)
+
+    def test_neutral_sentence_is_untouched(self):
+        self.assertEqual(P.sanitize_text(self.CLEAN), self.CLEAN)
+        self.assertFalse(P.has_fingerprint(self.CLEAN))
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.INTRO)
+        self.assertEqual(P.sanitize_text(once), once)
+
+
+class LegacyRewriteFingerprintTests(unittest.TestCase):
+    """The two rewrites that regressed into no-ops in v1.10.5 (issue #796)."""
+
+    def test_main_branch_fingerprint_is_rewritten(self):
+        source = "Main branch (you will usually use this for PRs): main"
+        out = P.sanitize_text(source)
+        self.assertEqual(
+            out, "Default branch (you will usually use this for PRs): main")
+        self.assertNotIn("Main branch (", out)
+
+    def test_feedback_fingerprint_is_rewritten(self):
+        source = ("To give feedback, users should report the issue at "
+                  "https://github.com/anthropics/claude-code/issues")
+        out = P.sanitize_text(source)
+        self.assertEqual(
+            out,
+            "To provide feedback, users should report the issue at "
+            "https://github.com/anthropics/claude-code/issues")
+        self.assertNotIn("To give feedback,", out)
+
+    def test_rewrites_are_not_noops(self):
+        for old, new in P.SANITIZE_REWRITES:
+            if old == "11-128":
+                continue
+            self.assertNotEqual(old, new, "rewrite is a no-op: %r" % old)
+
+
+class ClaudeCodeIntroFingerprintTests(unittest.TestCase):
+    """Claude Code 基础提示词首段（#733）。
+
+    报告者把提示词模式改成「替换」后 400 消失，确认指纹在 system 文本里。
+    旧规则把 ``Anthropic's official CLI for Claude`` 改写成 ``... CLI tool
+    for Claude``，反而把 ``You are Claude Code`` 保留下来；这里按 #743 处理
+    Codex 自述句的同一套办法整句中性化，并钉住 Anthropic 转换后的出站链路。
+    """
+
+    INTRO = "You are Claude Code, Anthropic's official CLI tool for Claude."
+    INTRO_NO_TOOL = "You are Claude Code, Anthropic's official CLI for Claude."
+    INTRO_CODE = "You are Claude Code, Anthropic\u2019s official CLI tool for Claude Code."
+    CLEAN = "You are a helpful AI assistant."
+
+    def test_intro_variants_neutralized(self):
+        for text in (self.INTRO, self.INTRO_NO_TOOL, self.INTRO_CODE,
+                     self.INTRO.lower(), self.INTRO.upper()):
+            self.assertTrue(P.has_fingerprint(text), text)
+            out = P.sanitize_text(text)
+            self.assertEqual(out, self.CLEAN, text)
+            self.assertFalse(P.has_fingerprint(out), text)
+
+    def test_embedded_in_system_prompt_preserves_surrounding_text(self):
+        text = "Before.\n" + self.INTRO + "\nAfter."
+        out = P.sanitize_text(text)
+        self.assertEqual(out, "Before.\n" + self.CLEAN + "\nAfter.")
+        self.assertFalse(P.has_fingerprint(out))
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.INTRO)
+        self.assertEqual(P.sanitize_text(once), once)
+
+    def test_scoped_to_system_developer_and_assistant(self):
+        out = P.sanitize_messages([
+            {"role": "system", "content": self.INTRO},
+            {"role": "developer", "content": self.INTRO},
+            {"role": "assistant", "content": self.INTRO},
+            {"role": "user", "content": self.INTRO},
+            {"role": "tool", "content": self.INTRO},
+        ])
+        for i in range(3):
+            self.assertEqual(out[i]["content"], self.CLEAN, out[i]["role"])
+        self.assertEqual(out[3]["content"], self.INTRO)
+        self.assertEqual(out[4]["content"], self.INTRO)
+
+    def test_other_claude_code_mentions_untouched(self):
+        for text in ("Claude Code is a CLI.", "Use Claude Code for this task."):
+            self.assertEqual(P.sanitize_text(text), text)
+
+    def test_anthropic_messages_path_carries_the_rewrite(self):
+        chat = P.messages_to_chat({
+            "model": "deepseek-v4.1-flash",
+            "system": [{"type": "text", "text": self.INTRO}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128,
+        })
+        body = P.build_upstream_body(chat)
+        self.assertEqual(body["messages"][0]["content"], self.CLEAN)
+        self.assertEqual(body["messages"][1]["content"], "hi")
+
+
+class AnthropicHeaderFingerprintTests(unittest.TestCase):
+    """#733：消息正文里的 Anthropic 头键值与 cc_* 尾部参数。"""
+
+    def test_header_pair_removed(self):
+        self.assertEqual(
+            P.sanitize_text("x-anthropic-billing-hdr: 1.0.0"), "")
+        self.assertEqual(
+            P.sanitize_text("before x-anthropic-billing-hdr: 1.0.0; after"),
+            "before after")
+
+    def test_header_key_is_case_insensitive(self):
+        self.assertEqual(
+            P.sanitize_text("X-ANTHROPIC-BILLING-HDR: abc;"), "")
+
+    def test_cc_parameter_removed(self):
+        self.assertEqual(P.sanitize_text("cc_system_prompt=1;"), "")
+        self.assertEqual(
+            P.sanitize_text("prompt cc_temperature=0.7; tail"),
+            "prompt tail")
+
+    def test_bare_header_is_reduced(self):
+        out = P.sanitize_text("`x-anthropic-billing-hdr`")
+        self.assertEqual(out, "`anthropic-header`")
+        self.assertFalse(P.has_fingerprint(out))
+
+    # #853 / #854：Claude Code 2.1.37+ 把完整键名写进 system 首块。
+    # v2.0.7 只认缩写 `...-hdr`，完整键名被原样留在出站文本里，
+    # 上游把 `x-anthropic-billing-header` 当保留关键字，回 400 / 11128。
+    FULL_HEADER = (
+        "x-anthropic-billing-header: cc_version=2.1.321.abc; "
+        "cc_entrypoint=cli; cch=00000;")
+
+    def test_full_header_line_removed(self):
+        self.assertTrue(P.has_fingerprint(self.FULL_HEADER))
+        out = P.sanitize_text(self.FULL_HEADER)
+        self.assertEqual(out, "")
+        self.assertFalse(P.has_fingerprint(out))
+
+    def test_full_header_line_removed_before_prompt(self):
+        text = self.FULL_HEADER + "\nYou are a helpful AI assistant."
+        self.assertEqual(P.sanitize_text(text), "You are a helpful AI assistant.")
+
+    def test_full_header_line_is_case_insensitive(self):
+        text = self.FULL_HEADER.upper() + "\nKeep this."
+        self.assertEqual(P.sanitize_text(text), "Keep this.")
+
+    def test_full_header_bare_key_is_reduced(self):
+        out = P.sanitize_text("`x-anthropic-billing-header`")
+        self.assertEqual(out, "`anthropic-header`")
+        self.assertFalse(P.has_fingerprint(out))
+
+    def test_header_only_system_message_is_dropped(self):
+        out = P.sanitize_messages([
+            {"role": "system", "content": self.FULL_HEADER},
+            {"role": "user", "content": "hi"},
+        ])
+        self.assertEqual([m["role"] for m in out], ["user"])
+
+    def test_anthropic_messages_path_drops_full_header_block(self):
+        chat = P.messages_to_chat({
+            "model": "deepseek-v4.1-flash",
+            "system": [
+                {"type": "text", "text": self.FULL_HEADER},
+                {"type": "text", "text": "You are a helpful AI assistant."},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128,
+        })
+        body = P.build_upstream_body(chat)
+        self.assertEqual(body["messages"][0]["content"],
+                         "You are a helpful AI assistant.")
+        self.assertNotIn("x-anthropic-billing-header",
+                         body["messages"][0]["content"])
+
+    def test_user_message_billing_metadata_is_untouched(self):
+        user = "Example:\n" + self.FULL_HEADER + "\nKeep this request unchanged."
+        out = P.sanitize_messages([
+            {"role": "system", "content": self.FULL_HEADER},
+            {"role": "user", "content": user},
+        ])
+        self.assertEqual([m["role"] for m in out], ["user"])
+        self.assertEqual(out[0]["content"], user)
+
+    def test_tool_result_and_arguments_billing_metadata_is_untouched(self):
+        args = json.dumps({
+            "header": "x-anthropic-billing-header: cc_version=2.1.321.abc;",
+            "keep": "tool argument {{literal}}",
+        })
+        result = self.FULL_HEADER + "\nTool result body."
+        original = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": args},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": result},
+        ]
+        out = P.sanitize_messages(original)
+        self.assertEqual(out[0]["tool_calls"][0]["function"]["arguments"], args)
+        self.assertEqual(json.loads(
+            out[0]["tool_calls"][0]["function"]["arguments"]), json.loads(args))
+        self.assertEqual(out[1]["content"], result)
+
+    def test_assistant_history_billing_metadata_is_untouched(self):
+        text = self.FULL_HEADER + "\nAssistant history body."
+        out = P.sanitize_messages([{"role": "assistant", "content": text}])
+        self.assertEqual(out[0]["content"], text)
+
+    def test_system_prose_and_fenced_examples_are_not_stripped(self):
+        prose = (
+            "Before the example.\n"
+            + self.FULL_HEADER
+            + "\nAfter the example."
+        )
+        fenced = "```text\n" + self.FULL_HEADER + "\n```"
+        bare = "Please explain x-anthropic-billing-header before using it."
+        out = P.sanitize_messages([
+            {"role": "system", "content": prose},
+            {"role": "developer", "content": fenced},
+            {"role": "system", "content": bare},
+        ])
+        self.assertEqual(out[0]["content"], prose)
+        self.assertEqual(out[1]["content"], fenced)
+        self.assertEqual(out[2]["content"], bare)
+
+    def test_system_header_plus_same_line_prose_is_conservative(self):
+        text = (
+            "x-anthropic-billing-header: cc_version=2.1.321.abc; "
+            "Keep this instruction."
+        )
+        out = P.sanitize_messages([{"role": "system", "content": text}])
+        self.assertEqual(out[0]["content"], text)
+
+    def test_scoped_cleanup_is_idempotent_and_does_not_mutate_input(self):
+        text = self.FULL_HEADER + "\nYou are a helpful AI assistant."
+        messages = [{"role": "system", "content": text}]
+        before = json.loads(json.dumps(messages))
+        first = P.sanitize_messages(messages)
+        second = P.sanitize_messages(first)
+        self.assertEqual(messages, before)
+        self.assertEqual(first[0]["content"], "You are a helpful AI assistant.")
+        self.assertEqual(second[0]["content"], first[0]["content"])
+
+    def test_system_text_blocks_drop_only_metadata_and_empty_blocks(self):
+        text = "You are a helpful AI assistant."
+        out = P.sanitize_messages([{
+            "role": "system",
+            "content": [
+                {"type": "text", "text": self.FULL_HEADER},
+                {"type": "text", "text": text},
+            ],
+        }])
+        self.assertEqual(out[0]["content"], [{"type": "text", "text": text}])
+
+    def test_system_metadata_only_block_list_drops_whole_message(self):
+        out = P.sanitize_messages([{
+            "role": "system",
+            "content": [{"type": "text", "text": self.FULL_HEADER}],
+        }])
+        self.assertEqual(out, [])
+
+    def test_system_metadata_removal_keeps_non_text_blocks(self):
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+        out = P.sanitize_messages([{
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": self.FULL_HEADER},
+                image,
+            ],
+        }])
+        self.assertEqual(out[0]["content"], [image])
 
 
 if __name__ == "__main__":

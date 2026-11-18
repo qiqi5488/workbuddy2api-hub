@@ -1,4 +1,4 @@
-"""上游风控限制 403（code 11140）：冷却、持久化，且不再换号连坐。
+"""上游账号封禁 403（code 11140）：停止派发、持久化，且不再换号连坐。
 
 实测正文：{"code":11140,"msg":"request illegal",...,"displayMsg":{"en":"Your
 account has been restricted due to unusual activity","zh":"账号存在异常行为，
@@ -13,8 +13,8 @@ account has been restricted due to unusual activity","zh":"账号存在异常行
 
 要钉住的行为：
 
-  1. 风控 403 与内容审核 403 分流：前者冷却账号 2 小时并**持久化**，默认
-     **不再换号重试**（一个请求只打一个号就停手，下一次请求自然会落到别的号）；
+  1. 风控 403 与内容审核 403 分流：前者把账号**持久禁用**，默认不再换号
+     重试（一个请求只打一个号就停手，下一次请求自然会落到别的号）；
   2. 同一窗口内多个账号被限制 → 整池暂停（连坐保护），暂停期间一个上游请求
      都不发；WB_RESTRICTION_HOLD_SECONDS=0 可关闭暂停；
   3. WB_RESTRICTED_403_ROTATE_MAX>0 可恢复旧的透明换号行为；
@@ -157,7 +157,7 @@ class ScriptedUpstream(object):
         return item
 
 
-PAYLOAD = {"model": "deepseek-v4.1-flash",
+PAYLOAD = {"model": "deepseek-v4.1-flash-sg",
            "messages": [{"role": "user", "content": "hi"}]}
 
 
@@ -185,11 +185,11 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.old_rotate = P.RESTRICTED_403_ROTATE_MAX
         self.old_min = P.RESTRICTION_WAVE_MIN
         self.old_window = P.RESTRICTION_WAVE_WINDOW
-        self.old_hold = P.RESTRICTION_HOLD_SECONDS
         P.RESTRICTED_403_ROTATE_MAX = 0
         P.RESTRICTION_WAVE_MIN = 2
         P.RESTRICTION_WAVE_WINDOW = 900.0
-        P.RESTRICTION_HOLD_SECONDS = 1800.0
+        P.wb_settings.set_restriction_hold_seconds(
+            P.ACCOUNTS_DIR, P.wb_settings.DEFAULT_RESTRICTION_HOLD_SECONDS)
         P.reset_restriction_state()
 
     def tearDown(self):
@@ -197,7 +197,6 @@ class Restricted403DispatchTests(unittest.TestCase):
         P.RESTRICTED_403_ROTATE_MAX = self.old_rotate
         P.RESTRICTION_WAVE_MIN = self.old_min
         P.RESTRICTION_WAVE_WINDOW = self.old_window
-        P.RESTRICTION_HOLD_SECONDS = self.old_hold
         P.reset_restriction_state()
 
     def _run(self, accounts, script):
@@ -228,11 +227,13 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.assertIsInstance(raised, P.ContentRejected)
         self.assertEqual(getattr(raised, "account_uid", None), "r1")
         self.assertIn("11140", raised.detail)
-        self.assertGreaterEqual(restricted.restricted_until - time.time(), 7000)
-        self.assertEqual(restricted.last_error, "HTTP 403 (account restricted)")
+        self.assertTrue(restricted.account_banned)
+        self.assertFalse(restricted.enabled)
+        self.assertFalse(restricted.tasks_enabled)
+        self.assertEqual(restricted.last_error, "HTTP 403 (account banned)")
         self.assertIn("11140", restricted.last_error_detail)
         self.assertEqual(healthy.cooldown_until, 0.0)
-        self.assertEqual(healthy.restricted_until, 0.0)
+        self.assertFalse(healthy.account_banned)
         # 下一次请求会落到健康账号：受限账号不再是候选。
         self.assertFalse(restricted.ready())
 
@@ -246,7 +247,8 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.assertEqual(len(upstream.calls), 2)
         self.assertIsNone(raised)
         self.assertEqual(resp[1].uid, "h1")
-        self.assertGreaterEqual(restricted.restricted_until - time.time(), 7000)
+        self.assertTrue(restricted.account_banned)
+        self.assertFalse(restricted.enabled)
         self.assertEqual(healthy.cooldown_until, 0.0)
 
     def test_lone_restricted_account_still_reports_the_reason(self):
@@ -258,8 +260,9 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.assertIsInstance(raised, P.ContentRejected)
         self.assertEqual(getattr(raised, "account_uid", None), "r-only")
         self.assertIn("11140", raised.detail)
-        # 单号场景不再退化成 3 秒冷却：2 小时内不会再打这个号。
-        self.assertGreaterEqual(restricted.restricted_until - time.time(), 7000)
+        # 单号场景不会退化成 3 秒冷却：手动启用前不会再打这个号。
+        self.assertTrue(restricted.account_banned)
+        self.assertFalse(restricted.enabled)
 
     def test_two_restrictions_pause_the_whole_pool(self):
         first = make_account("a1")
@@ -285,7 +288,7 @@ class Restricted403DispatchTests(unittest.TestCase):
             wb_accounts.urlopen = real_urlopen
 
     def test_hold_switch_can_disable_the_pause(self):
-        P.RESTRICTION_HOLD_SECONDS = 0.0
+        P.wb_settings.set_restriction_hold_seconds(P.ACCOUNTS_DIR, 0)
         first = make_account("a1")
         second = make_account("b1")
         P.POOL = StubPool([first, second])
@@ -309,7 +312,7 @@ class Restricted403DispatchTests(unittest.TestCase):
             [http_error(403, CONTENT_BODY), http_error(403, CONTENT_BODY)])
         # 内容审核 403 不给账号上长冷却（这不是账号的坏）。
         self.assertEqual(a.cooldown_until, 0.0)
-        self.assertEqual(a.restricted_until, 0.0)
+        self.assertFalse(a.account_banned)
         self.assertEqual(b.cooldown_until, 0.0)
         self.assertIsNone(resp)
         self.assertIsInstance(raised, P.ContentRejected)
@@ -323,6 +326,67 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.assertIsNone(raised)
         self.assertEqual(resp[1].uid, "f2")
         self.assertEqual(flaky.fails, 1)
+
+
+class ChannelGuardAttributionTests(unittest.TestCase):
+    """400 透传也要写明用了哪个账号、哪个代理出口（#743）。
+
+    400 在 open_upstream() 里直接 raise（不轮转、不改正文），旧实现因此
+    绕过了函数末尾的 account_uid 附加，错误行只能记成 unattributed。
+    """
+
+    def setUp(self):
+        self._old_pool = P.POOL
+        self._old_rotate = P.RESTRICTED_403_ROTATE_MAX
+        P.RESTRICTED_403_ROTATE_MAX = 0
+
+    def tearDown(self):
+        P.POOL = self._old_pool
+        P.RESTRICTED_403_ROTATE_MAX = self._old_rotate
+
+    def _run(self, scripts):
+        account = wb_accounts.Account({
+            "uid": "400-user-1", "accessToken": "t-800",
+            "realm": "intl", "proxy": "http://user:pass@127.0.0.1:17913",
+            "proxySlot": "slot-8",
+        })
+        P.POOL = StubPool([account])
+        upstream = ScriptedUpstream(scripts)
+        real_urlopen = wb_accounts.urlopen
+        wb_accounts.urlopen = upstream
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                P.open_upstream(dict(PAYLOAD), target_realm="intl")
+        finally:
+            wb_accounts.urlopen = real_urlopen
+        return ctx.exception, upstream
+
+    def test_400_carries_account_and_egress(self):
+        body = json.dumps({
+            "code": "11-128",
+            "msg": "Illegal API invocation from an unapproved channel",
+        }).encode("utf-8")
+        raised, upstream = self._run([http_error(400, body)])
+        self.assertIsInstance(raised, urllib.error.HTTPError)
+        self.assertEqual(len(upstream.calls), 1)
+        self.assertEqual(getattr(raised, "account_uid", None), "400-user-1")
+        self.assertEqual(getattr(raised, "proxy_slot", None), "slot-8")
+        self.assertEqual(getattr(raised, "proxy_exit", None), "127.0.0.1:17913")
+
+    def test_hundreds_of_400s_keep_the_attribution(self):
+        body = b'{"code":11-128,"msg":"Illegal API invocation"}'
+        for _ in range(22):
+            raised, _upstream = self._run([http_error(400, body)])
+            self.assertEqual(getattr(raised, "account_uid", None), "400-user-1")
+            self.assertEqual(getattr(raised, "proxy_slot", None), "slot-8")
+            self.assertEqual(getattr(raised, "proxy_exit", None),
+                             "127.0.0.1:17913")
+
+    def test_egress_exit_never_leaks_proxy_credentials(self):
+        self.assertEqual(P.egress_exit(""), "direct")
+        self.assertEqual(P.egress_exit("http://user:secret@10.0.0.9:8080"),
+                         "10.0.0.9:8080")
+        self.assertEqual(P.egress_exit("10.0.0.9:8080"), "10.0.0.9:8080")
 
 
 class IdentityOnRetryTests(unittest.TestCase):
@@ -395,7 +459,7 @@ class IdentityOnRetryTests(unittest.TestCase):
                             second["x-conversation-request-id"])
         self.assertNotIn("x-b3-parentspanid", first)
         self.assertEqual(first["user-agent"],
-                         "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0")
+                         "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0")
         # 桌面端的请求体与浏览器头都保持原样（不 gzip）。
         self.assertNotIn("content-encoding", first)
         self.assertNotEqual(upstream.calls[0].data[:2], b"\x1f\x8b")
@@ -405,7 +469,7 @@ class IdentityOnRetryTests(unittest.TestCase):
         self.assertIn("x-codebuddy-request", first)
         self.assertIn("accept-language", first)
 class RestrictionPersistenceTests(unittest.TestCase):
-    """限制期限是账号状态：落盘、重启/清冷却/测试都不能把它放回池子。"""
+    """封禁是账号状态：落盘、重启/清冷却/测试都不能把它放回池子。"""
 
     def setUp(self):
         self.directory = tempfile.mkdtemp(prefix="wb-restrict-persist-")
@@ -421,36 +485,79 @@ class RestrictionPersistenceTests(unittest.TestCase):
         account.save(self.directory)
         with open(account.path, encoding="utf-8") as fh:
             data = json.load(fh)
-        self.assertGreater(data.get("restrictedUntil") or 0, time.time() + 7000)
+        self.assertTrue(data.get("accountBanned"))
+        self.assertFalse(data.get("enabled"))
+        self.assertFalse(data.get("tasksEnabled"))
         reloaded = wb_accounts.Account(data, account.path)
-        self.assertGreater(reloaded.restricted_until, time.time() + 7000)
+        self.assertTrue(reloaded.account_banned)
+        self.assertFalse(reloaded.enabled)
         self.assertFalse(reloaded.ready())
-        self.assertIn("上游风控限制", reloaded.unavailable_reason())
+        self.assertIn("账号封禁", reloaded.unavailable_reason())
 
     def test_clear_error_keeps_the_restriction(self):
         account = self._restricted()
         account.clear_error()
-        self.assertGreater(account.restricted_until, time.time() + 7000)
+        self.assertTrue(account.account_banned)
         account.clear_error(keep_caps=True)
-        self.assertGreater(account.restricted_until, time.time() + 7000)
+        self.assertTrue(account.account_banned)
 
-    def test_a_successful_request_lifts_the_restriction(self):
+    def test_a_successful_request_does_not_lift_the_ban(self):
         account = self._restricted()
         account.note_success()
-        self.assertEqual(account.restricted_until, 0.0)
-        self.assertTrue(account.ready())
+        self.assertTrue(account.account_banned)
+        self.assertFalse(account.ready())
 
-    def test_restriction_expires_on_its_own(self):
+    def test_ban_never_expires_on_its_own(self):
         account = self._restricted()
-        account.restricted_until = time.time() - 1
-        self.assertTrue(account.ready())
+        account.banned_at = time.time() - 365 * 86400
+        self.assertFalse(account.ready())
         self.assertEqual(account.throttle_wait(), 0.0)
 
-    def test_repeated_detection_does_not_extend_the_window(self):
+    def test_manual_enable_is_the_only_clear(self):
         account = self._restricted()
-        first = account.restricted_until
+        account.clear_account_ban()
+        self.assertFalse(account.account_banned)
+        account.enabled = True
+        account.tasks_enabled = True
+        self.assertTrue(account.ready())
+
+    def test_legacy_future_window_migrates_to_ban(self):
+        data = {"uid": "legacy", "accessToken": "t-legacy", "realm": "intl",
+                "enabled": True, "tasksEnabled": True,
+                "restrictedUntil": time.time() + 3600}
+        account = wb_accounts.Account(data)
+        self.assertTrue(account.account_banned)
+        self.assertFalse(account.enabled)
+        self.assertFalse(account.tasks_enabled)
+        self.assertFalse(account.ready())
+
+    def test_repeated_detection_is_idempotent(self):
+        account = self._restricted()
+        first = account.banned_at
         account.note_restricted(detail='{"code":11140}')
-        self.assertAlmostEqual(account.restricted_until, first, delta=0.01)
+        self.assertAlmostEqual(account.banned_at, first, delta=0.01)
+
+    def test_reimport_does_not_clear_ban(self):
+        with tempfile.TemporaryDirectory(prefix="wb-restrict-readd-") as directory:
+            pool = wb_accounts.AccountPool(directory)
+            account = self._restricted("reimport")
+            pool.add(account)
+            replacement = wb_accounts.Account({
+                "uid": "reimport", "accessToken": "new-token", "realm": "intl",
+                "enabled": True, "tasksEnabled": True,
+            })
+            pool.add(replacement)
+            self.assertTrue(pool.get("reimport").account_banned)
+            self.assertFalse(pool.get("reimport").enabled)
+
+    def test_manual_pool_enable_clears_ban(self):
+        with tempfile.TemporaryDirectory(prefix="wb-restrict-enable-") as directory:
+            pool = wb_accounts.AccountPool(directory)
+            account = self._restricted("manual")
+            pool.add(account)
+            pool.set_enabled("manual", True)
+            self.assertFalse(pool.get("manual").account_banned)
+            self.assertTrue(pool.get("manual").enabled)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,14 @@ function mkEl(id){
     closest(){ return this._label || null; },
     addEventListener(){}, setAttribute(){}, getAttribute(n){ return this.attrs[n] || ''; },
     insertAdjacentHTML(){}, removeChild(){}, remove(){},
+    // v2.x 面板启动时会先搭页面骨架（把 section 插到页面容器里），这些 DOM
+    // 方法在真浏览器里都有；桩不补就会在脚本求值阶段直接抛错。
+    insertBefore(){}, replaceChild(){}, append(){}, prepend(){},
+    cloneNode(){ return this; }, matches(){ return false; }, contains(){ return false; },
+    getElementsByTagName(){ return []; }, getElementsByClassName(){ return []; },
+    hasAttribute(){ return false; }, removeAttribute(){}, getBoundingClientRect(){
+      return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    },
   };
 }
 const els = {};
@@ -68,6 +76,8 @@ global.setInterval = () => 0; global.clearInterval = () => {};
 global.setTimeout = () => 0; global.clearTimeout = () => {};
 global.location = { href: '', search: '', hash: '' };
 global.alert = () => {}; global.confirm = () => false;
+// 面板启动时会读主题变量（getComputedStyle(<html>).getPropertyValue(...)）。
+global.getComputedStyle = () => ({ getPropertyValue(){ return ''; } });
 
 let api;
 try {

@@ -240,18 +240,19 @@ check("and that value lands on the usage row",
 
 # A model the catalog pins to one level runs there whether or not the client
 # says anything - and the gateway writes nothing into the body for it, so the
-# body alone reports no effort at all.
-check("the catalog pins gemini-3.5-flash", P.model_fixed_effort("gemini-3.5-flash") == "medium",
-      P.model_fixed_effort("gemini-3.5-flash"))
+# body alone reports no effort at all. kimi-k3 is the pinned sample: the old
+# gemini-3.5-flash left the catalogue in 2026-11.
+check("the catalog pins kimi-k3", P.model_fixed_effort("kimi-k3") == "medium",
+      P.model_fixed_effort("kimi-k3"))
 check("and it declares no default",
-      P.model_default_effort("gemini-3.5-flash") is None,
-      P.model_default_effort("gemini-3.5-flash"))
-plain = P.build_upstream_body(chat("gemini-3.5-flash"))
+      P.model_default_effort("kimi-k3") is None,
+      P.model_default_effort("kimi-k3"))
+plain = P.build_upstream_body(chat("kimi-k3"))
 check("a plain request to it carries no effort in the body",
       P.client_effort_of(plain) is None, P.client_effort_of(plain))
-effort = open_with(chat("gemini-3.5-flash"))
+effort = open_with(chat("kimi-k3"))
 check("open_upstream still reports the pinned level", effort == "medium", effort)
-P.record_usage("gemini-3.5-flash", USAGE, stream=False, elapsed_ms=900, effort=effort)
+P.record_usage("kimi-k3", USAGE, stream=False, elapsed_ms=900, effort=effort)
 check("so the pinned level reaches the usage row",
       rows()[-1].get("reasoning_effort") == "medium", rows()[-1].get("reasoning_effort"))
 check("kimi-k3 is pinned the same way", open_with(chat("kimi-k3")) == "medium",
@@ -261,11 +262,11 @@ check("kimi-k3 is pinned the same way", open_with(chat("kimi-k3")) == "medium",
 # upstream ran at the level the request asked for, so the log line, the usage row
 # and the panel badge all named a level the request never ran at.
 check("a level the request carries is reported, not replaced by the pin",
-      open_with(chat("gemini-3.5-flash", reasoning_effort="max")) == "max",
-      open_with(chat("gemini-3.5-flash", reasoning_effort="max")))
-check("and the pin is only used when the request carries nothing",
-      open_with(chat("gemini-3.5-flash")) == "medium",
-      open_with(chat("gemini-3.5-flash")))
+      open_with(chat("deepseek-v4.1-flash", reasoning_effort="max")) == "max",
+      open_with(chat("deepseek-v4.1-flash", reasoning_effort="max")))
+check("a model with a catalog default reports it when the request carries nothing",
+      open_with(chat("gemini-3.8-flash")) == "medium",
+      open_with(chat("gemini-3.8-flash")))
 
 # A level the model's own controls cannot offer is warned about, never
 # corrected: the upstream validates loosely, so a value outside the catalogue is
@@ -286,8 +287,8 @@ check("switching thinking off is not a mismatch",
       P.model_offers_effort("deepseek-v4.1-flash", "none") is True
       and P.model_offers_effort("deepseek-v4.1-flash", None) is True)
 check("a model pinned to one level never complains",
-      P.model_offers_effort("gemini-3.5-flash", "xhigh") is True,
-      P.model_offers_effort("gemini-3.5-flash", "xhigh"))
+      P.model_offers_effort("kimi-k3", "xhigh") is True,
+      P.model_offers_effort("kimi-k3", "xhigh"))
 check("and the check still sees the deepseek levels",
       P.model_offers_effort("deepseek-v4.1-flash", "xhigh") is False,
       P.model_offers_effort("deepseek-v4.1-flash", "xhigh"))
@@ -298,6 +299,12 @@ offbeat = P.build_upstream_body({"model": "deepseek-v4.1-flash",
                                  "reasoning": "xhigh"})
 check("an off-catalogue level is still forwarded unchanged",
       offbeat.get("reasoning_effort") == "xhigh", offbeat.get("reasoning_effort"))
+
+# 说明：上游 v1.7.19 起的 `reasoning_effort_map`（默认开启）会在请求离开前把模型
+# 不支持的档位改写成该模型的默认档，那时"实际跑的档位"就是改写后的值（例如
+# kimi-k3 被钉在 medium，带 max 的请求会跑在 medium）。本文件把映射关掉（见文件
+# 开头写入的 settings.json），专门验证"请求自带值 vs 目录默认值"这两个来源不会
+# 互相冒充；映射本身由上游自己的 map_reasoning_effort 测试覆盖。
 
 # A selectable model with no client value runs at its declared default, and the
 # client's own value wins when it sends one.

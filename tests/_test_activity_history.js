@@ -109,7 +109,11 @@ const chipOf = (html, name) => {
 // state says "没有记录不等于失败" on purpose, so a substring test against the
 // whole chip would read that explanation as a failure.
 const chipText = (chip) => {
-  const m = String(chip || '').match(/>([^<]*)<\/span>\s*$/);
+  // 「今日活动」格里现在还有一个窄屏专用的任务开关（.acct-task-mobile），
+  // 它排在这一格末尾。取可见文本前先把它摘掉，否则匹配到的是「任务开/关」。
+  const activityOnly = String(chip || '').replace(
+    /<span class="acct-task-mobile">[\s\S]*?<\/span><\/span>/, '');
+  const m = activityOnly.match(/>([^<]*)<\/span>\s*$/);
   return m ? m[1] : '';
 };
 const accountsOut = () => document.getElementById('accounts').innerHTML;
@@ -145,6 +149,10 @@ const check = (label, cond, extra) => {
   check('an account with no event and no completion says 无记录, not a failure',
         chipText(chipOf(out, '丙 · 无记录')) === '今日签到 · 无记录'
         && (chipOf(out, '丙 · 无记录') || '').includes('badge off'),
+        JSON.stringify(chipOf(out, '丙 · 无记录')));
+  check('unknown CN status is not presented as an upstream failure to check in',
+        (chipOf(out, '丙 · 无记录') || '').includes('无本地记录')
+        && !(chipOf(out, '丙 · 无记录') || '').includes('未签到'),
         JSON.stringify(chipOf(out, '丙 · 无记录')));
   check('the failure chip is rendered as a failure, not as a success',
         (chipOf(out, '丁 · 失败') || '').includes('badge bad'),
@@ -242,7 +250,7 @@ const check = (label, cond, extra) => {
         historyOut().includes('title="&lt;img src=x onerror=alert(1)&gt; 上游 500"'),
         historyOut().slice(0, 300));
   check('the message cell truncates instead of widening the modal',
-        historyOut().includes('text-overflow:ellipsis'));
+        historyOut().includes('note-clip'));
   check('both results render, each on its own row',
         historyOut().includes('badge bad') && historyOut().includes('badge ok'));
 
@@ -302,7 +310,7 @@ const check = (label, cond, extra) => {
   check('the modal markup is in the shipped page',
         modal.includes('签到与每日活跃记录'), modal.slice(0, 80));
   check('the history table is a data-cards table, so it collapses on a phone',
-        modal.includes('<table class="data-cards">'));
+        modal.includes('<table class="data-cards activity-table">'));
   check('every filter control is in the modal',
         ['actRange', 'actUid', 'actTask', 'actResult'].every(id => modal.includes('id="' + id + '"')));
   check('an empty or failed list spans the whole card grid',

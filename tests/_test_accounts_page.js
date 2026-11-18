@@ -58,8 +58,9 @@ assert.ok(names(mainTabs[1]).includes('accounts'), 'accounts 必须在主标签�
 
 // 切到账号页要顺手把签到记录拉起来；开关关掉（默认）时账号区就在
 // 「网关与账号」页，切到网关页同样要拉。
-assert.ok(/if\(tab === 'accounts' \|\| \(!_accountsSeparateTab && tab === 'gateway'\)\)\{ loadActivityBoard\(\); \}/.test(script),
-  '切到账号页（或合并后的网关页）应触发 loadActivityBoard');
+assert.ok(script.includes("if(tab === 'accounts' || (!_accountsSeparateTab && tab === 'overview')){ loadActivityBoard(); }")
+  || script.includes("if(tab === 'accounts' || (!_accountsSeparateTab && tab === 'gateway')){ loadActivityBoard(); }"),
+  '切到账号页（或合并后的网关/总览页）应触发 loadActivityBoard');
 
 // 签到记录区块的骨架
 for(const id of ['activityRange', 'activityTask', 'activityResult', 'activityAccount',
@@ -118,21 +119,23 @@ assert.ok(/data\.accounts_separate_tab === true/.test(script),
 assert.ok(/postJSON\('\/settings\/save', \{accounts_separate_tab: value\}\)/.test(script),
   '保存应只 patch accounts_separate_tab 一个键');
 // 合并之后「账号」的书签不能停在内容已经不在了的空页上
-assert.ok(/if\(tab === 'accounts' && !_accountsSeparateTab\) tab = 'gateway';/.test(script),
-  '合并模式下 ?tab=accounts 应退回「网关与账号」页');
+assert.ok(/if\(tab === 'accounts' && !_accountsSeparateTab\) tab = window\.__NEXT_UI__ \? 'overview' : 'gateway';/.test(script),
+  '合并模式下 ?tab=accounts 应退回「网关与账号」/总览页');
 
 /* ---- 1c. 一键切换所有出站身份 --------------------------------------- */
 
 // 按钮在账号工具栏里，紧跟「一键分配代理」
 assert.ok(/id="btnProductAll"[^>]*onclick="cycleAllProducts\(this\)"/.test(html),
   '账号工具栏缺少「一键切换所有出站身份」按钮');
-assert.ok(/一键分配代理<\/button>\s*<button class="sec" id="btnProductAll"/.test(html),
-  '按钮应排在「一键分配代理」之后');
+assert.ok(/分配代理<\/button>\s*<button class="sec" id="btnProductAll"/.test(html),
+  '按钮应排在「分配代理」之后');
 // 当前身分要有个能定位的节点，不能只留一段裸文本（否则 JS 改不动它）
 assert.ok(html.includes('<span id="productAllLabel">'), '按钮上的当前身分缺少可定位节点');
-// 批量靠「不带 uid」：带上 uid 就退化成单账号切换
-assert.ok(/postJSON\('\/accounts\/product', \{product: next\}\)/.test(script),
-  '批量切换只应提交 product，不能带 uid');
+// 作用范围由 acctScopeUids() 决定（有勾选取勾选，否则当前筛选结果），因此提交
+// 时必须带 uids 点名；不带 uids 会退化成全池切换。
+assert.ok(/postJSON\('\/accounts\/product', \{product: next, uids: list\.map\(a => a\.uid\)\}\)/
+    .test(script),
+  '批量切换应提交 product + uids 点名');
 // 身分取值与轮转顺序必须与服务端 wb_identity.VALID_PRODUCTS 一致
 assert.ok(/PRODUCT_ORDER = \['workbuddy', 'vscode', 'cli'\]/.test(script),
   '轮转顺序应与服务端身分取值一致');
@@ -168,7 +171,8 @@ dom.installDom({
         json: () => Promise.resolve({}), text: () => Promise.resolve('')});
     }
     return Promise.resolve({ok: true, status: 200,
-      json: () => Promise.resolve(RESPONSE), text: () => Promise.resolve('')});
+      json: () => Promise.resolve(RESPONSE),
+      text: () => Promise.resolve(JSON.stringify(RESPONSE))});
   },
 });
 
@@ -185,6 +189,20 @@ try {
       accountsSeparateTab: accountsSeparateTab,
       updateProductAllButton: updateProductAllButton,
       cycleAllProducts: cycleAllProducts,
+      accountErrorCode: accountErrorCode,
+      accountMatchesFilters: accountMatchesFilters,
+      filteredAccountsForBulk: filteredAccountsForBulk,
+      setAccountErrorFilter: setAccountErrorFilter,
+      selectFilteredAccounts: selectFilteredAccounts,
+      selectedAccountsForBulk: selectedAccountsForBulk,
+      setAll: setAll,
+      exportAccounts: exportAccounts,
+      toggleAcctSelAll: toggleAcctSelAll,
+      updateBatchPoolBar: updateBatchPoolBar,
+      deleteAccounts: deleteAccounts,
+      clearAccountSelection: clearAccountSelection,
+      ACCOUNT_FILTERS: ACCOUNT_FILTERS,
+      ACCOUNT_SELECTED: ACCOUNT_SELECTED,
     };`)();
 } catch(e) {
   console.log = realLog;
@@ -199,6 +217,169 @@ function check(label, ok, detail){
 }
 
 (async () => {
+  // 错误码筛选：必须读上游正文 code，而不是只匹配错误文案；全选只作用于
+  // 当前筛选结果，删除只作用于已勾选账号。
+  api.ACCOUNT_FILTERS.errorCode = '';
+  check('从 lastErrorDetail 提取 11140',
+    api.accountErrorCode({lastErrorDetail: '{"code":11140,"msg":"request illegal"}'}) === '11140');
+  check('从 lastError 的 HTTP 标签提取 429',
+    api.accountErrorCode({lastError: 'HTTP 429 (rate limited)'}) === '429');
+  check('从 code:6004 标签提取 6004',
+    api.accountErrorCode({lastError: 'HTTP 429 · code:6004'}) === '6004');
+  check('无错误码时返回空串',
+    api.accountErrorCode({lastError: 'network down'}) === '');
+
+  window.VIEW_REALM = 'intl';
+  window.ACCOUNTS = [
+    {uid: 'a-11140', nickname: 'A', realm: 'intl', enabled: false,
+     accountBanned: true,
+     lastErrorDetail: '{"code":11140,"msg":"restricted"}'},
+    {uid: 'b-11140', nickname: 'B', realm: 'intl', enabled: false,
+     accountBanned: true,
+     lastError: 'HTTP 403 · code:11140'},
+    {uid: 'c-6004', nickname: 'C', realm: 'intl', enabled: true,
+     lastError: 'HTTP 429 · code:6004'},
+    {uid: 'd-cn', nickname: 'D', realm: 'cn', enabled: true,
+     lastErrorDetail: '{"code":11140}'},
+  ];
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('11140');
+  const hit = api.filteredAccountsForBulk();
+  check('错误码筛选只命中当前视图的 11140 账号',
+    JSON.stringify(hit.map(a => a.uid)) === JSON.stringify(['a-11140', 'b-11140']),
+    JSON.stringify(hit.map(a => a.uid)));
+  check('选择错误码后自动勾选全部命中账号',
+    JSON.stringify([...api.ACCOUNT_SELECTED].sort()) ===
+      JSON.stringify(['a-11140', 'b-11140']),
+    JSON.stringify([...api.ACCOUNT_SELECTED]));
+
+  api.selectFilteredAccounts({disabled: false});
+  check('全选筛选结果只选中当前视图命中的账号',
+    JSON.stringify([...api.ACCOUNT_SELECTED].sort()) ===
+      JSON.stringify(['a-11140', 'b-11140']),
+    JSON.stringify([...api.ACCOUNT_SELECTED]));
+
+  const SEED = () => ([
+    {uid: 'a-11140', nickname: 'A', realm: 'intl', enabled: false,
+     accountBanned: true,
+     lastErrorDetail: '{"code":11140,"msg":"restricted"}'},
+    {uid: 'b-11140', nickname: 'B', realm: 'intl', enabled: false,
+     accountBanned: true,
+     lastError: 'HTTP 403 · code:11140'},
+    {uid: 'c-6004', nickname: 'C', realm: 'intl', enabled: true,
+     lastError: 'HTTP 429 · code:6004'},
+    {uid: 'd-cn', nickname: 'D', realm: 'cn', enabled: true,
+     lastErrorDetail: '{"code":11140}'},
+  ]);
+  const lastSetAll = () => {
+    const call = POSTS.filter(p => p.url === '/accounts/set-all').pop();
+    return call ? JSON.parse(call.body) : {};
+  };
+  const uidsOf = body => (body.uids || []).slice().sort();
+
+  /* 启用 / 停用 / 导出 / 删除 是同一套作用域：有勾选就是勾选的号，没有勾选
+     就是当前筛选结果。上一版把这些能力拆成四个「xx 已选」按钮，没有勾选时
+     全是灰的，什么也做不了。 */
+
+  // a) 有勾选：只作用于勾选的账号。
+  window.ACCOUNTS = SEED();
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('11140');
+  POSTS = [];
+  await api.setAll(true, {disabled: false});
+  check('启用：有勾选时只提交勾选的 uids',
+    lastSetAll().enabled === true &&
+      JSON.stringify(uidsOf(lastSetAll())) === JSON.stringify(['a-11140', 'b-11140']),
+    JSON.stringify(POSTS));
+
+  window.ACCOUNTS = SEED();
+  POSTS = [];
+  await api.setAll(false, {disabled: false});
+  check('停用：有勾选时只提交勾选的 uids',
+    lastSetAll().enabled === false &&
+      JSON.stringify(uidsOf(lastSetAll())) === JSON.stringify(['a-11140', 'b-11140']),
+    JSON.stringify(POSTS));
+
+  // b) 没有勾选：作用于当前筛选结果（当前视图内，国内版不参与）。
+  window.ACCOUNTS = SEED();
+  api.setAccountErrorFilter('');
+  api.clearAccountSelection();
+  POSTS = [];
+  await api.setAll(true, {disabled: false});
+  check('启用：没有勾选时作用于当前筛选结果的全部账号',
+    JSON.stringify(uidsOf(lastSetAll())) ===
+      JSON.stringify(['a-11140', 'b-11140', 'c-6004']),
+    JSON.stringify(lastSetAll()));
+
+  window.ACCOUNTS = SEED();
+  api.setAccountErrorFilter('');
+  api.clearAccountSelection();
+  POSTS = [];
+  await api.setAll(false, {disabled: false});
+  check('停用：没有勾选时作用于当前筛选结果的全部账号',
+    lastSetAll().enabled === false &&
+      JSON.stringify(uidsOf(lastSetAll())) ===
+        JSON.stringify(['a-11140', 'b-11140', 'c-6004']),
+    JSON.stringify(lastSetAll()));
+
+  // c) 导出：同一套作用域。
+  window.ACCOUNTS = SEED();
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('11140');
+  REQUESTS = [];
+  RESPONSE = {count: 2, accounts: window.ACCOUNTS, rows: [], total: 0};
+  await api.exportAccounts({disabled: false});
+  check('导出：有勾选时只导出勾选的账号',
+    REQUESTS.some(u => u.indexOf('/accounts/export?uid=a-11140&uid=b-11140') === 0),
+    JSON.stringify(REQUESTS));
+
+  window.ACCOUNTS = SEED();
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('');
+  REQUESTS = [];
+  await api.exportAccounts({disabled: false});
+  check('导出：没有勾选时导出当前筛选结果的全部账号',
+    REQUESTS.some(u => u.indexOf('/accounts/export?uid=a-11140&uid=b-11140&uid=c-6004') === 0),
+    JSON.stringify(REQUESTS));
+
+  // d) 删除：同一套作用域，没有勾选时删的是整屏筛选结果。
+  window.ACCOUNTS = SEED();
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('');
+  POSTS = [];
+  await api.deleteAccounts({disabled: false});
+  check('删除：没有勾选时删除当前筛选结果的全部账号',
+    POSTS.filter(p => p.url === '/accounts/delete')
+      .map(p => JSON.parse(p.body).uid).sort().join(',') ===
+        'a-11140,b-11140,c-6004',
+    JSON.stringify(POSTS));
+
+  window.ACCOUNTS = SEED();
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('11140');
+  POSTS = [];
+  await api.deleteAccounts({disabled: false});
+  check('删除：有勾选时只删除勾选的账号',
+    POSTS.filter(p => p.url === '/accounts/delete')
+      .map(p => JSON.parse(p.body).uid).sort().join(',') === 'a-11140,b-11140',
+    JSON.stringify(POSTS));
+  check('删除成功后清空已选状态', api.ACCOUNT_SELECTED.size === 0,
+    JSON.stringify([...api.ACCOUNT_SELECTED]));
+  api.ACCOUNT_FILTERS.errorCode = '';
+
+  // e) 表头全选 = 当前筛选结果全选（跨页），不是只选本页。
+  window.ACCOUNTS = SEED();
+  api.clearAccountSelection();
+  api.setAccountErrorFilter('');
+  api.toggleAcctSelAll({checked: true});
+  check('表头全选覆盖当前筛选结果的全部账号（含未显示的分页）',
+    JSON.stringify([...api.ACCOUNT_SELECTED].sort()) ===
+      JSON.stringify(['a-11140', 'b-11140', 'c-6004']),
+    JSON.stringify([...api.ACCOUNT_SELECTED]));
+  api.toggleAcctSelAll({checked: false});
+  check('表头取消全选清空筛选结果内的勾选', api.ACCOUNT_SELECTED.size === 0,
+    JSON.stringify([...api.ACCOUNT_SELECTED]));
+
   // 2a. 默认筛选：近 7 天、100 行；没有记录时给出空态而不是一张空表
   el('activityRange').value = '7d';
   el('activityTask').value = '';
@@ -238,7 +419,7 @@ function check(label, ok, detail){
   const h = listHtml();
   check('时间按落盘的墙上时间显示', h.includes('10-09 21:03'), h.slice(0, 160));
   check('昵称进账号列', h.includes('老王'));
-  check('昵称标记为不翻译', h.includes('<span data-no-i18n>老王</span>'));
+  check('昵称标记为不翻译', h.includes('data-no-i18n') && h.includes('>老王</span>'));
   check('没有昵称时回落到 uid 前 8 位', h.includes('uid-abcd'), h.slice(0, 400));
   check('区域列', h.includes('国内版') && h.includes('国际版'));
   check('任务列', h.includes('国内版签到') && h.includes('国际版每日活跃'));
@@ -300,6 +481,8 @@ function check(label, ok, detail){
     REQUESTS.some(u => u.indexOf('/activity/history') === 0), JSON.stringify(REQUESTS));
 
   // 2j. 开关：区块在两页之间搬家，页签名与「账号」页签的显隐跟着走。
+  // 此段验证用户显式选择经典布局时的文案；默认控制台另行验证。
+  document.documentElement.removeAttribute('data-console-layout');
   // 假 DOM 不把 HTML 解析成树（getElementById 是惰性建元素），所以这里按**运行时**
   // 的真实结构自己搭最小场景——initPageNav() 会把页面内容整体包进 .page-nav-body，
   // 两个锚点因此都不是页面 div 的直接子节点。踩过的坑：直接对页面 div 调
@@ -361,6 +544,12 @@ function check(label, ok, detail){
   check('拆开后网关页签改回「网关」', el('navGatewayLabel').textContent === '网关',
     el('navGatewayLabel').textContent);
   check('拆开后开关读回来是开', api.accountsSeparateTab() === true);
+
+  document.documentElement.setAttribute('data-console-layout', 'on');
+  api.applyAccountsTabLayout(false);
+  check('控制台布局保持运行概览文案', el('navGatewayLabel').textContent === '运行概览');
+  check('控制台布局仍将账号区合并到网关页', moved.every(s => kids(gatewayBody).includes(s)));
+
 
   // 2k. 一键切换所有出站身份：按钮显示当前身分，点一下切到下一个并提交全量
   window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'workbuddy'}];
